@@ -3,6 +3,7 @@
 //  leanring-buddyTests
 //
 
+import AppKit
 import AVFoundation
 import Foundation
 import Testing
@@ -162,15 +163,37 @@ struct VoicePipelineTests {
         }
     }
 
-    private final class TestOllamaModelCatalog: OllamaModelCataloging {
+    private final class TestOllamaModelCatalog: OllamaModelCataloging, @unchecked Sendable {
+        private var catalogSnapshots: [OllamaModelCatalogSnapshot]
+        private let startOllamaAppResult: Bool
         private(set) var preloadModelNames: [String] = []
+        private(set) var startOllamaAppCallCount = 0
+
+        init(
+            catalogSnapshots: [OllamaModelCatalogSnapshot] = [
+                OllamaModelCatalogSnapshot(models: [], runtimeStatus: .ready, loadedModelNames: [])
+            ],
+            startOllamaAppResult: Bool = true
+        ) {
+            self.catalogSnapshots = catalogSnapshots
+            self.startOllamaAppResult = startOllamaAppResult
+        }
 
         func fetchCatalogSnapshot() async -> OllamaModelCatalogSnapshot {
-            OllamaModelCatalogSnapshot(models: [], runtimeStatus: .ready, loadedModelNames: [])
+            if catalogSnapshots.count > 1 {
+                return catalogSnapshots.removeFirst()
+            }
+
+            return catalogSnapshots.first ?? OllamaModelCatalogSnapshot(
+                models: [],
+                runtimeStatus: .ready,
+                loadedModelNames: []
+            )
         }
 
         func startOllamaApp() async -> Bool {
-            true
+            startOllamaAppCallCount += 1
+            return startOllamaAppResult
         }
 
         func pullModel(
@@ -183,7 +206,7 @@ struct VoicePipelineTests {
         }
     }
 
-    private final class TestOllamaChatClient: OllamaChatStreaming {
+    private final class TestOllamaChatClient: OllamaChatStreaming, @unchecked Sendable {
         private let responseText: String
         private(set) var streamedUserPrompts: [String] = []
 
@@ -205,10 +228,16 @@ struct VoicePipelineTests {
         }
     }
 
-    private final class TestLocalSpeechSynthesizer: LocalSpeechSynthesizing {
+    private final class TestLocalSpeechSynthesizer: LocalSpeechSynthesizing, @unchecked Sendable {
         private(set) var spokenTexts: [String] = []
         private(set) var stopCallCount = 0
+        private(set) var prepareCallCount = 0
         var isSpeaking = false
+        var runtimeStatus: LocalSpeechRuntimeStatus = .ready(voiceName: "test_voice")
+
+        func prepareIfNeeded() {
+            prepareCallCount += 1
+        }
 
         func speakText(_ text: String) async {
             isSpeaking = true
@@ -219,6 +248,31 @@ struct VoicePipelineTests {
         func stopPlayback() {
             stopCallCount += 1
             isSpeaking = false
+        }
+    }
+
+    private final class TestGlobalPushToTalkShortcutMonitor: GlobalPushToTalkShortcutMonitor, @unchecked Sendable {
+        private let startResult: Bool
+        private(set) var startCallCount = 0
+        private(set) var stopCallCount = 0
+        var grantsAccessibilityForAppFlowOverride: Bool?
+
+        init(startResult: Bool = true) {
+            self.startResult = startResult
+            super.init()
+        }
+
+        override var grantsAccessibilityForAppFlow: Bool {
+            grantsAccessibilityForAppFlowOverride ?? super.grantsAccessibilityForAppFlow
+        }
+
+        override func start() -> Bool {
+            startCallCount += 1
+            return startResult
+        }
+
+        override func stop() {
+            stopCallCount += 1
         }
     }
 
@@ -238,6 +292,7 @@ struct VoicePipelineTests {
             permissionRequester: { true },
             defaultFinalTranscriptFallbackDelaySeconds: 0.01
         )
+        defer { manager.cancelCurrentDictation() }
 
         var submittedDrafts: [String] = []
 
@@ -283,6 +338,7 @@ struct VoicePipelineTests {
             permissionRequester: { true },
             defaultFinalTranscriptFallbackDelaySeconds: 0.01
         )
+        defer { manager.cancelCurrentDictation() }
 
         await manager.startPushToTalkFromKeyboardShortcut(
             currentDraftText: "",
@@ -314,6 +370,7 @@ struct VoicePipelineTests {
             permissionRequester: { true },
             defaultFinalTranscriptFallbackDelaySeconds: 0.01
         )
+        defer { manager.cancelCurrentDictation() }
 
         let startTask = Task {
             await manager.startPushToTalkFromKeyboardShortcut(
@@ -380,6 +437,7 @@ struct VoicePipelineTests {
             permissionRequester: { true },
             defaultFinalTranscriptFallbackDelaySeconds: 0.01
         )
+        defer { manager.cancelCurrentDictation() }
 
         var submittedDrafts: [String] = []
 
@@ -424,6 +482,7 @@ struct VoicePipelineTests {
             permissionRequester: { true },
             defaultFinalTranscriptFallbackDelaySeconds: 0.01
         )
+        defer { manager.cancelCurrentDictation() }
 
         var submittedDrafts: [String] = []
 
@@ -490,6 +549,10 @@ struct VoicePipelineTests {
             loadedOllamaModelNames: ["gemma4:e4b"],
             ollamaRuntimeStatus: .ready
         )
+        defer {
+            manager.stop()
+            UserDefaults.standard.removeObject(forKey: "selectedOllamaModel")
+        }
 
         manager.sendTranscriptToModelWithOptionalScreenshots(transcript: "   ")
         await Task.yield()
@@ -524,18 +587,212 @@ struct VoicePipelineTests {
             loadedOllamaModelNames: [],
             ollamaRuntimeStatus: .ready
         )
+        defer {
+            manager.stop()
+            UserDefaults.standard.removeObject(forKey: "selectedOllamaModel")
+        }
 
         manager.sendTranscriptToModelWithOptionalScreenshots(transcript: "help me")
-
-        try await waitUntil {
-            speechSynthesizer.spokenTexts.count == 1 && manager.voiceState == .idle
-        }
+        await manager.waitForCurrentResponseForTesting()
 
         #expect(catalog.preloadModelNames == ["gemma4:e4b"])
         #expect(chatClient.streamedUserPrompts == ["help me"])
         #expect(speechSynthesizer.spokenTexts == ["local answer"])
         #expect(screenshotCaptureCallCount == 0)
         #expect(manager.isSelectedModelLoaded)
+        #expect(manager.voiceState == .idle)
+    }
+
+    @Test func launchBootstrapAutoStartsOllamaAndLoadsResolvedModel() async throws {
+        let modelDescriptors = [
+            OllamaModelDescriptor(
+                name: "gemma4:e4b",
+                supportsVision: true,
+                parameterSize: "4B",
+                quantizationLevel: "Q4_K_M"
+            )
+        ]
+        let catalog = TestOllamaModelCatalog(
+            catalogSnapshots: [
+                OllamaModelCatalogSnapshot(models: [], runtimeStatus: .unavailable, loadedModelNames: []),
+                OllamaModelCatalogSnapshot(models: modelDescriptors, runtimeStatus: .ready, loadedModelNames: []),
+                OllamaModelCatalogSnapshot(models: modelDescriptors, runtimeStatus: .ready, loadedModelNames: ["gemma4:e4b"]),
+            ]
+        )
+        let manager = CompanionManager(
+            ollamaModelCatalog: catalog,
+            ollamaChatClient: TestOllamaChatClient(responseText: "unused [POINT:none]"),
+            localSpeechSynthesizer: TestLocalSpeechSynthesizer(),
+            selectedModel: "gemma4:e4b"
+        )
+        defer { UserDefaults.standard.removeObject(forKey: "selectedOllamaModel") }
+
+        manager.bootstrapOllamaRuntimeOnLaunch()
+        await manager.waitForOllamaPreparationForTesting()
+
+        #expect(catalog.preloadModelNames == ["gemma4:e4b"])
+        #expect(manager.selectedModel == "gemma4:e4b")
+        #expect(manager.isSelectedModelLoaded)
+        #expect(manager.ollamaActionState == .idle)
+        manager.stop()
+    }
+
+    @Test func changingModelLoadsTheNewSelection() async throws {
+        let modelDescriptors = [
+            OllamaModelDescriptor(
+                name: "gemma4:e4b",
+                supportsVision: true,
+                parameterSize: "4B",
+                quantizationLevel: "Q4_K_M"
+            ),
+            OllamaModelDescriptor(
+                name: "llama3.2",
+                supportsVision: false,
+                parameterSize: "3B",
+                quantizationLevel: "Q4_K_M"
+            ),
+        ]
+        let catalog = TestOllamaModelCatalog(
+            catalogSnapshots: [
+                OllamaModelCatalogSnapshot(models: modelDescriptors, runtimeStatus: .ready, loadedModelNames: ["gemma4:e4b"]),
+                OllamaModelCatalogSnapshot(models: modelDescriptors, runtimeStatus: .ready, loadedModelNames: ["gemma4:e4b", "llama3.2"]),
+            ]
+        )
+        let manager = CompanionManager(
+            ollamaModelCatalog: catalog,
+            ollamaChatClient: TestOllamaChatClient(responseText: "unused [POINT:none]"),
+            localSpeechSynthesizer: TestLocalSpeechSynthesizer(),
+            selectedModel: "gemma4:e4b",
+            availableOllamaModels: modelDescriptors,
+            loadedOllamaModelNames: ["gemma4:e4b"],
+            ollamaRuntimeStatus: .ready
+        )
+        defer { UserDefaults.standard.removeObject(forKey: "selectedOllamaModel") }
+
+        manager.setSelectedModel("llama3.2")
+        await manager.waitForOllamaPreparationForTesting()
+
+        #expect(manager.selectedModel == "llama3.2")
+        #expect(manager.isSelectedModelLoaded)
+        #expect(catalog.preloadModelNames == ["llama3.2"])
+        #expect(manager.ollamaActionState == .idle)
+        manager.stop()
+    }
+
+    @Test func companionStartKeepsGlobalShortcutMonitorIndependentFromPermissionRefresh() async throws {
+        let modelDescriptors = [
+            OllamaModelDescriptor(
+                name: "gemma4:e4b",
+                supportsVision: true,
+                parameterSize: "4B",
+                quantizationLevel: "Q4_K_M"
+            )
+        ]
+        let globalMonitor = TestGlobalPushToTalkShortcutMonitor()
+        let speechSynthesizer = TestLocalSpeechSynthesizer()
+        let manager = CompanionManager(
+            globalPushToTalkShortcutMonitor: globalMonitor,
+            ollamaModelCatalog: TestOllamaModelCatalog(
+                catalogSnapshots: [
+                    OllamaModelCatalogSnapshot(models: modelDescriptors, runtimeStatus: .ready, loadedModelNames: ["gemma4:e4b"]),
+                    OllamaModelCatalogSnapshot(models: modelDescriptors, runtimeStatus: .ready, loadedModelNames: ["gemma4:e4b"]),
+                ]
+            ),
+            ollamaChatClient: TestOllamaChatClient(responseText: "unused [POINT:none]"),
+            localSpeechSynthesizer: speechSynthesizer,
+            selectedModel: "gemma4:e4b",
+            availableOllamaModels: modelDescriptors,
+            loadedOllamaModelNames: ["gemma4:e4b"],
+            ollamaRuntimeStatus: .ready
+        )
+        defer { UserDefaults.standard.removeObject(forKey: "selectedOllamaModel") }
+
+        manager.start()
+        manager.refreshAllPermissions()
+
+        #expect(globalMonitor.startCallCount == 1)
+        #expect(globalMonitor.stopCallCount == 0)
+        #expect(speechSynthesizer.prepareCallCount == 1)
+
+        manager.stop()
+        #expect(globalMonitor.stopCallCount == 1)
+    }
+
+    @Test func activeGlobalShortcutMonitorCountsAsAccessibilityGrant() async throws {
+        let globalMonitor = TestGlobalPushToTalkShortcutMonitor()
+        globalMonitor.grantsAccessibilityForAppFlowOverride = true
+
+        let manager = CompanionManager(
+            globalPushToTalkShortcutMonitor: globalMonitor,
+            ollamaModelCatalog: TestOllamaModelCatalog(),
+            ollamaChatClient: TestOllamaChatClient(responseText: "unused [POINT:none]"),
+            localSpeechSynthesizer: TestLocalSpeechSynthesizer()
+        )
+        defer { manager.stop() }
+
+        manager.refreshAllPermissions()
+
+        #expect(manager.hasAccessibilityPermission)
+    }
+
+    @Test func leftControlShortcutPressRequiresOnlyLeftControl() {
+        let pressTransition = BuddyPushToTalkShortcut.shortcutTransition(
+            for: .flagsChanged,
+            keyCode: BuddyPushToTalkShortcut.leftControlKeyCode,
+            modifierFlagsRawValue: UInt64(NSEvent.ModifierFlags.control.rawValue),
+            wasShortcutPreviouslyPressed: false
+        )
+
+        #expect(pressTransition == .pressed)
+
+        let extraModifierTransition = BuddyPushToTalkShortcut.shortcutTransition(
+            for: .flagsChanged,
+            keyCode: BuddyPushToTalkShortcut.leftControlKeyCode,
+            modifierFlagsRawValue: UInt64((NSEvent.ModifierFlags.control.union(.option)).rawValue),
+            wasShortcutPreviouslyPressed: false
+        )
+
+        #expect(extraModifierTransition == .none)
+    }
+
+    @Test func leftControlShortcutIgnoresRightControlAndReleasesOnLeftControlLift() {
+        let rightControlTransition = BuddyPushToTalkShortcut.shortcutTransition(
+            for: .flagsChanged,
+            keyCode: 62,
+            modifierFlagsRawValue: UInt64(NSEvent.ModifierFlags.control.rawValue),
+            wasShortcutPreviouslyPressed: false
+        )
+
+        #expect(rightControlTransition == .none)
+
+        let releaseTransition = BuddyPushToTalkShortcut.shortcutTransition(
+            for: .flagsChanged,
+            keyCode: BuddyPushToTalkShortcut.leftControlKeyCode,
+            modifierFlagsRawValue: 0,
+            wasShortcutPreviouslyPressed: true
+        )
+
+        #expect(releaseTransition == .released)
+    }
+
+    @Test func companionTracksFallbackSpeechRuntimeState() async throws {
+        let speechSynthesizer = TestLocalSpeechSynthesizer()
+        speechSynthesizer.runtimeStatus = .usingFallback("fallback voice is active")
+        let manager = CompanionManager(
+            globalPushToTalkShortcutMonitor: TestGlobalPushToTalkShortcutMonitor(),
+            ollamaModelCatalog: TestOllamaModelCatalog(),
+            ollamaChatClient: TestOllamaChatClient(responseText: "unused [POINT:none]"),
+            localSpeechSynthesizer: speechSynthesizer
+        )
+        defer {
+            manager.stop()
+            UserDefaults.standard.removeObject(forKey: "selectedOllamaModel")
+        }
+
+        manager.start()
+
+        #expect(manager.speechRuntimeStatus == .usingFallback("fallback voice is active"))
+        #expect(manager.speechStatusTitle == "Using system voice")
     }
 
     private func waitUntil(

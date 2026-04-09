@@ -2,9 +2,9 @@
 //  GlobalPushToTalkShortcutMonitor.swift
 //  leanring-buddy
 //
-//  Captures push-to-talk keyboard shortcuts while makesomething is running in the
-//  background. Uses a listen-only CGEvent tap so modifier-only shortcuts like
-//  ctrl + option behave more like a real system-wide voice tool.
+//  Captures the global push-to-talk shortcut for the full app lifetime.
+//  Uses a dedicated event-tap thread so the shortcut remains active even when
+//  the menu bar panel is closed or Clicky is not the active app.
 //
 
 import AppKit
@@ -12,17 +12,37 @@ import Combine
 import CoreGraphics
 import Foundation
 
-final class GlobalPushToTalkShortcutMonitor: ObservableObject {
+enum GlobalPushToTalkMonitorState: Equatable {
+    case stopped
+    case listening
+    case failed(String)
+}
+
+class GlobalPushToTalkShortcutMonitor: ObservableObject {
+    private final class StartupResultBox {
+        var didStart = false
+        var failureReason: String?
+    }
+
     let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
+    private var monitorRunLoop: CFRunLoop?
+    private var monitorThread: Thread?
+    private var eventTapShortcutPressed = false
+
     @Published private(set) var hasActiveEventTap = false
-    /// Mutated exclusively from the CGEvent tap callback, which runs on
-    /// `CFRunLoopGetMain()` and therefore always executes on the main thread.
-    /// Published so the overlay can hide immediately on key release without
-    /// waiting for the async dictation state pipeline to catch up.
     @Published private(set) var isShortcutCurrentlyPressed = false
+    @Published private(set) var monitorState: GlobalPushToTalkMonitorState = .stopped
+
+    /// Clicky's app flow only needs proof that the system is allowing the
+    /// global shortcut monitor to operate. That is a practical proxy for the
+    /// permission gate even when AXIsProcessTrusted() lags or returns a false
+    /// negative for the current dev build.
+    var grantsAccessibilityForAppFlow: Bool {
+        hasActiveEventTap || monitorState == .listening
+    }
 
     deinit {
         stop()
@@ -30,16 +50,95 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
     @discardableResult
     func start() -> Bool {
-        // If the event tap is already running, don't restart it.
-        // Restarting resets isShortcutCurrentlyPressed, which would kill
-        // the waveform overlay mid-press when the permission poller calls
-        // refreshAllPermissions → start() every few seconds.
+        if monitorThread != nil {
+            return hasActiveEventTap
+        }
+
+        let startupResultBox = StartupResultBox()
+        let startupSemaphore = DispatchSemaphore(value: 0)
+
+        let monitorThread = Thread { [weak self] in
+            self?.runMonitorLoop(
+                startupResultBox: startupResultBox,
+                startupSemaphore: startupSemaphore
+            )
+        }
+        monitorThread.name = "com.clicky.global-push-to-talk"
+        monitorThread.start()
+        self.monitorThread = monitorThread
+
+        _ = startupSemaphore.wait(timeout: .now() + 3)
+
+        if !startupResultBox.didStart {
+            self.monitorThread = nil
+            let failureReason = startupResultBox.failureReason ?? "Clicky couldn't install the global hotkey monitor."
+            DispatchQueue.main.async {
+                self.hasActiveEventTap = false
+                self.monitorState = .failed(failureReason)
+            }
+            print("⚠️ Global push-to-talk: \(failureReason)")
+        }
+
+        return startupResultBox.didStart
+    }
+
+    func stop() {
+        DispatchQueue.main.async {
+            self.hasActiveEventTap = false
+            self.isShortcutCurrentlyPressed = false
+            self.monitorState = .stopped
+        }
+
+        guard let monitorRunLoop else {
+            monitorThread = nil
+            return
+        }
+
+        CFRunLoopPerformBlock(monitorRunLoop, CFRunLoopMode.commonModes.rawValue) { [weak self] in
+            guard let self else { return }
+            self.teardownEventTap()
+            self.eventTapShortcutPressed = false
+            self.monitorRunLoop = nil
+            CFRunLoopStop(monitorRunLoop)
+        }
+        CFRunLoopWakeUp(monitorRunLoop)
+        monitorThread = nil
+    }
+
+    private func runMonitorLoop(
+        startupResultBox: StartupResultBox,
+        startupSemaphore: DispatchSemaphore
+    ) {
+        autoreleasepool {
+            monitorRunLoop = CFRunLoopGetCurrent()
+
+            let didStart = installEventTap()
+            startupResultBox.didStart = didStart
+            if !didStart {
+                startupResultBox.failureReason = "Clicky couldn't create a global keyboard event tap."
+            }
+            startupSemaphore.signal()
+
+            guard didStart else {
+                monitorRunLoop = nil
+                return
+            }
+
+            CFRunLoopRun()
+            teardownEventTap()
+        }
+    }
+
+    private func installEventTap() -> Bool {
         guard globalEventTap == nil else {
-            hasActiveEventTap = true
+            DispatchQueue.main.async {
+                self.hasActiveEventTap = true
+                self.monitorState = .listening
+            }
             return true
         }
 
-        let monitoredEventTypes: [CGEventType] = [.flagsChanged, .keyDown, .keyUp]
+        let monitoredEventTypes: [CGEventType] = [.flagsChanged]
         let eventMask = monitoredEventTypes.reduce(CGEventMask(0)) { currentMask, eventType in
             currentMask | (CGEventMask(1) << eventType.rawValue)
         }
@@ -59,45 +158,49 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             )
         }
 
-        guard let globalEventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .listenOnly,
-            eventsOfInterest: eventMask,
-            callback: eventTapCallback,
-            userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else {
-            hasActiveEventTap = false
-            print("⚠️ Global push-to-talk: couldn't create CGEvent tap")
-            return false
+        let candidateTapLocations: [CGEventTapLocation] = [.cghidEventTap, .cgSessionEventTap]
+
+        for candidateTapLocation in candidateTapLocations {
+            guard let createdEventTap = CGEvent.tapCreate(
+                tap: candidateTapLocation,
+                place: .headInsertEventTap,
+                options: .listenOnly,
+                eventsOfInterest: eventMask,
+                callback: eventTapCallback,
+                userInfo: Unmanaged.passUnretained(self).toOpaque()
+            ) else {
+                continue
+            }
+
+            guard let createdRunLoopSource = CFMachPortCreateRunLoopSource(
+                kCFAllocatorDefault,
+                createdEventTap,
+                0
+            ) else {
+                CFMachPortInvalidate(createdEventTap)
+                continue
+            }
+
+            globalEventTap = createdEventTap
+            globalEventTapRunLoopSource = createdRunLoopSource
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), createdRunLoopSource, .commonModes)
+            CGEvent.tapEnable(tap: createdEventTap, enable: true)
+
+            DispatchQueue.main.async {
+                self.hasActiveEventTap = true
+                self.monitorState = .listening
+            }
+
+            print("🎙️ Global push-to-talk: event tap installed via \(candidateTapLocation)")
+            return true
         }
 
-        guard let globalEventTapRunLoopSource = CFMachPortCreateRunLoopSource(
-            kCFAllocatorDefault,
-            globalEventTap,
-            0
-        ) else {
-            CFMachPortInvalidate(globalEventTap)
-            hasActiveEventTap = false
-            print("⚠️ Global push-to-talk: couldn't create event tap run loop source")
-            return false
-        }
-
-        self.globalEventTap = globalEventTap
-        self.globalEventTapRunLoopSource = globalEventTapRunLoopSource
-
-        CFRunLoopAddSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
-        CGEvent.tapEnable(tap: globalEventTap, enable: true)
-        hasActiveEventTap = true
-        return true
+        return false
     }
 
-    func stop() {
-        isShortcutCurrentlyPressed = false
-        hasActiveEventTap = false
-
+    private func teardownEventTap() {
         if let globalEventTapRunLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), globalEventTapRunLoopSource, .commonModes)
             self.globalEventTapRunLoopSource = nil
         }
 
@@ -113,6 +216,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     ) -> Unmanaged<CGEvent>? {
         if eventType == .tapDisabledByTimeout || eventType == .tapDisabledByUserInput {
             if let globalEventTap {
+                print("🎙️ Global push-to-talk: re-enabling disabled event tap")
                 CGEvent.tapEnable(tap: globalEventTap, enable: true)
             }
             return Unmanaged.passUnretained(event)
@@ -123,18 +227,24 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             for: eventType,
             keyCode: eventKeyCode,
             modifierFlagsRawValue: event.flags.rawValue,
-            wasShortcutPreviouslyPressed: isShortcutCurrentlyPressed
+            wasShortcutPreviouslyPressed: eventTapShortcutPressed
         )
 
         switch shortcutTransition {
         case .none:
             break
         case .pressed:
-            isShortcutCurrentlyPressed = true
-            shortcutTransitionPublisher.send(.pressed)
+            eventTapShortcutPressed = true
+            DispatchQueue.main.async {
+                self.isShortcutCurrentlyPressed = true
+                self.shortcutTransitionPublisher.send(.pressed)
+            }
         case .released:
-            isShortcutCurrentlyPressed = false
-            shortcutTransitionPublisher.send(.released)
+            eventTapShortcutPressed = false
+            DispatchQueue.main.async {
+                self.isShortcutCurrentlyPressed = false
+                self.shortcutTransitionPublisher.send(.released)
+            }
         }
 
         return Unmanaged.passUnretained(event)

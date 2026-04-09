@@ -35,6 +35,14 @@ struct CompanionPanelView: View {
                 }
             }
 
+            if companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 12)
+
+                speechRuntimeStatusRow
+                    .padding(.horizontal, 16)
+            }
+
             if !companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 16)
@@ -135,7 +143,7 @@ struct CompanionPanelView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.allPermissionsGranted {
-            Text("Hold Control + Option to talk. Release to send.")
+            Text("Hold the left Control key to talk. Release to send.")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -145,7 +153,7 @@ struct CompanionPanelView: View {
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
-                Text("Grant microphone, accessibility, screen recording, and screen content access to use push-to-talk with screenshots.")
+                Text("Grant microphone, accessibility, and screen recording to use push-to-talk with screenshots.")
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -174,10 +182,6 @@ struct CompanionPanelView: View {
             accessibilityPermissionRow
 
             screenRecordingPermissionRow
-
-            if companionManager.hasScreenRecordingPermission {
-                screenContentPermissionRow
-            }
 
         }
     }
@@ -320,52 +324,6 @@ struct CompanionPanelView: View {
         }
 
         return "Only takes a screenshot when you use the hotkey"
-    }
-
-    private var screenContentPermissionRow: some View {
-        let isGranted = companionManager.hasScreenContentPermission
-        return HStack {
-            HStack(spacing: 8) {
-                Image(systemName: "eye")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
-                    .frame(width: 16)
-
-                Text("Screen Content")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
-            }
-
-            Spacer()
-
-            if isGranted {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(DS.Colors.success)
-                        .frame(width: 6, height: 6)
-                    Text("Granted")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
-                }
-            } else {
-                Button(action: {
-                    companionManager.requestScreenContentPermission()
-                }) {
-                    Text("Grant")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(DS.Colors.textOnAccent)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(
-                            Capsule()
-                                .fill(DS.Colors.accent)
-                        )
-                }
-                .buttonStyle(.plain)
-                .pointerCursor()
-            }
-        }
-        .padding(.vertical, 6)
     }
 
     private var microphonePermissionRow: some View {
@@ -712,6 +670,53 @@ struct CompanionPanelView: View {
             RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
                 .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
         )
+    }
+
+    private var speechRuntimeStatusRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(speechStatusColor)
+                    .frame(width: 8, height: 8)
+                    .shadow(color: speechStatusColor.opacity(0.5), radius: 4)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(companionManager.speechStatusTitle)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+
+                    Text(companionManager.speechStatusMessage)
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+
+    private var speechStatusColor: Color {
+        switch companionManager.speechRuntimeStatus {
+        case .idle:
+            return DS.Colors.textTertiary
+        case .preparing:
+            return DS.Colors.warning
+        case .ready:
+            return DS.Colors.success
+        case .usingFallback:
+            return DS.Colors.warning
+        }
     }
 
     private func modelMetadataText(for modelDescriptor: OllamaModelDescriptor) -> String {

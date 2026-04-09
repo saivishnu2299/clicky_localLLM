@@ -7,6 +7,13 @@
 
 import Foundation
 
+enum LocalSpeechRuntimeStatus: Equatable {
+    case idle
+    case preparing(String)
+    case ready(voiceName: String)
+    case usingFallback(String)
+}
+
 protocol OllamaModelCataloging {
     func fetchCatalogSnapshot() async -> OllamaModelCatalogSnapshot
     @MainActor
@@ -32,6 +39,8 @@ protocol OllamaChatStreaming {
 @MainActor
 protocol LocalSpeechSynthesizing: AnyObject {
     var isSpeaking: Bool { get }
+    var runtimeStatus: LocalSpeechRuntimeStatus { get }
+    func prepareIfNeeded()
     func speakText(_ text: String) async
     func stopPlayback()
 }

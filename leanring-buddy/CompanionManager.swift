@@ -109,10 +109,10 @@ final class CompanionManager: ObservableObject {
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
 
-    /// True when all three required permissions (accessibility, screen recording,
-    /// microphone) are granted. Used by the panel to show a single "all good" state.
+    /// True when the always-on interaction path is ready: accessibility for the
+    /// global event tap, screen recording for screenshots, and microphone input.
     var allPermissionsGranted: Bool {
-        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
+        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission
     }
 
     /// Whether the blue cursor overlay is currently visible on screen.
@@ -123,6 +123,7 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var loadedOllamaModelNames: Set<String> = []
     @Published private(set) var ollamaRuntimeStatus: OllamaRuntimeStatus = .checking
     @Published private(set) var ollamaActionState: CompanionOllamaActionState = .idle
+    @Published private(set) var speechRuntimeStatus: LocalSpeechRuntimeStatus = .idle
 
     /// The selected Ollama model used for local responses. Persisted to UserDefaults.
     @Published var selectedModel: String
@@ -153,12 +154,14 @@ final class CompanionManager: ObservableObject {
         self.availableOllamaModels = availableOllamaModels
         self.loadedOllamaModelNames = loadedOllamaModelNames
         self.ollamaRuntimeStatus = ollamaRuntimeStatus
+        self.speechRuntimeStatus = self.localSpeechSynthesizer.runtimeStatus
     }
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedOllamaModel")
-        loadSelectedModelFromPanel(force: true)
+        loadedOllamaModelNames.remove(model)
+        prepareOllamaRuntime(forceModelReload: true)
     }
 
     var selectedModelDescriptor: OllamaModelDescriptor? {
@@ -195,6 +198,32 @@ final class CompanionManager: ObservableObject {
         Self.recommendedOllamaModelName
     }
 
+    var speechStatusTitle: String {
+        switch speechRuntimeStatus {
+        case .idle:
+            return "Speech setup pending"
+        case .preparing:
+            return "Preparing Kokoro"
+        case .ready:
+            return "Kokoro ready"
+        case .usingFallback:
+            return "Using system voice"
+        }
+    }
+
+    var speechStatusMessage: String {
+        switch speechRuntimeStatus {
+        case .idle:
+            return "Clicky will prepare better local speech as soon as it starts."
+        case .preparing(let progress):
+            return progress
+        case .ready(let voiceName):
+            return "\(voiceName) is ready for natural local replies."
+        case .usingFallback(let message):
+            return message
+        }
+    }
+
     var selectedModelStatusTitle: String {
         if selectedModel.isEmpty {
             return "No model selected"
@@ -229,10 +258,10 @@ final class CompanionManager: ObservableObject {
         }
 
         if selectedModelSupportsVision {
-            return "Installed locally. Load it once and Clicky will use screenshots, pointing, and spoken replies."
+            return "Installed locally. Clicky is preparing it so screenshots, pointing, and spoken replies are ready."
         }
 
-        return "Installed locally. Load it once and Clicky will answer with spoken text-only help."
+        return "Installed locally. Clicky is preparing it for spoken text-only help."
     }
 
     var ollamaStatusTitle: String {
@@ -253,7 +282,7 @@ final class CompanionManager: ObservableObject {
         case .checking:
             return "Checking Ollama"
         case .unavailable:
-            return "Ollama Not Running"
+            return "Preparing Ollama"
         case .noLocalModels:
             return "Install a Local Model"
         case .ready:
@@ -277,9 +306,9 @@ final class CompanionManager: ObservableObject {
 
         switch ollamaRuntimeStatus {
         case .checking:
-            return "Checking your local Ollama runtime."
+            return "Clicky is checking your local Ollama runtime."
         case .unavailable:
-            return "Start Ollama from this panel. Clicky will connect as soon as the local runtime is up."
+            return "Clicky starts Ollama automatically on launch. If that stalls, use the controls here to retry."
         case .noLocalModels:
             return "Install the recommended local model here and Clicky will select it automatically."
         case .ready:
@@ -348,13 +377,17 @@ final class CompanionManager: ObservableObject {
 
     func start() {
         installApplicationDidBecomeActiveObserver()
+        _ = globalPushToTalkShortcutMonitor.start()
         refreshAllPermissions()
+        refreshSpeechRuntimeStatus()
+        localSpeechSynthesizer.prepareIfNeeded()
+        refreshSpeechRuntimeStatus()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
-        refreshOllamaRuntime()
+        bootstrapOllamaRuntimeOnLaunch()
 
         if allPermissionsGranted && isClickyCursorEnabled {
             overlayWindowManager.hasShownOverlayBefore = true
@@ -363,64 +396,27 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    func bootstrapOllamaRuntimeOnLaunch() {
+        prepareOllamaRuntime(forceModelReload: false)
+    }
+
     func refreshOllamaRuntime(shouldPrepareSelectedModel: Bool = true) {
-        if !ollamaActionState.isBusy {
-            ollamaActionState = .idle
-        }
-        ollamaRuntimeStatus = .checking
-
-        Task {
-            let catalogSnapshot = await ollamaModelCatalog.fetchCatalogSnapshot()
-
-            availableOllamaModels = catalogSnapshot.models
-            loadedOllamaModelNames = catalogSnapshot.loadedModelNames
-            ollamaRuntimeStatus = catalogSnapshot.runtimeStatus
-
-            if let resolvedSelectedModelName = OllamaModelCatalog.defaultModelName(
-                from: catalogSnapshot.models,
-                savedModelName: selectedModel
-            ) {
-                if selectedModel != resolvedSelectedModelName {
-                    setSelectedModel(resolvedSelectedModelName)
-                }
-            } else if catalogSnapshot.runtimeStatus != .ready {
-                selectedModel = ""
-                UserDefaults.standard.removeObject(forKey: "selectedOllamaModel")
-            }
-
-            if shouldPrepareSelectedModel,
-               catalogSnapshot.runtimeStatus == .ready,
-               !selectedModel.isEmpty,
-               !catalogSnapshot.loadedModelNames.contains(selectedModel) {
-                loadSelectedModelFromPanel()
-            }
-        }
+        prepareOllamaRuntime(forceModelReload: false, shouldPrepareSelectedModel: shouldPrepareSelectedModel)
     }
 
     func startOllamaFromPanel() {
-        guard !ollamaActionState.isBusy else { return }
-
-        ollamaControlTask?.cancel()
-        ollamaActionState = .startingApp
-
-        ollamaControlTask = Task {
-            let didStart = await ollamaModelCatalog.startOllamaApp()
-            guard !Task.isCancelled else { return }
-
-            if didStart {
-                await MainActor.run {
-                    self.ollamaActionState = .idle
-                    self.refreshOllamaRuntime()
-                }
-            } else {
-                await MainActor.run {
-                    self.ollamaActionState = .failure(
-                        "Clicky couldn't launch the Ollama app. Install Ollama for macOS or open it once manually."
-                    )
-                }
-            }
-        }
+        prepareOllamaRuntime(forceModelReload: false, shouldPrepareSelectedModel: true)
     }
+
+    #if DEBUG
+    func waitForCurrentResponseForTesting() async {
+        await currentResponseTask?.value
+    }
+
+    func waitForOllamaPreparationForTesting() async {
+        await ollamaControlTask?.value
+    }
+    #endif
 
     func installRecommendedModelFromPanel() {
         guard !ollamaActionState.isBusy else { return }
@@ -456,7 +452,7 @@ final class CompanionManager: ObservableObject {
                     self.ollamaActionState = .idle
                     self.selectedModel = Self.recommendedOllamaModelName
                     UserDefaults.standard.set(Self.recommendedOllamaModelName, forKey: "selectedOllamaModel")
-                    self.refreshOllamaRuntime()
+                    self.prepareOllamaRuntime(forceModelReload: true)
                 }
             } catch is CancellationError {
                 // Ignore cancellation.
@@ -471,37 +467,113 @@ final class CompanionManager: ObservableObject {
     }
 
     func loadSelectedModelFromPanel(force: Bool = false) {
-        guard isOllamaReady else { return }
-        guard !selectedModel.isEmpty else { return }
-        guard force || !isSelectedModelLoaded else {
+        prepareOllamaRuntime(forceModelReload: force || !isSelectedModelLoaded, shouldPrepareSelectedModel: true)
+    }
+
+    private func prepareOllamaRuntime(
+        forceModelReload: Bool,
+        shouldPrepareSelectedModel: Bool = true
+    ) {
+        ollamaControlTask?.cancel()
+
+        if !ollamaActionState.isBusy {
+            ollamaActionState = .idle
+        }
+        ollamaRuntimeStatus = .checking
+
+        ollamaControlTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runOllamaPreparationTask(
+                forceModelReload: forceModelReload,
+                shouldPrepareSelectedModel: shouldPrepareSelectedModel
+            )
+        }
+    }
+
+    private func runOllamaPreparationTask(
+        forceModelReload: Bool,
+        shouldPrepareSelectedModel: Bool
+    ) async {
+        var catalogSnapshot = await ollamaModelCatalog.fetchCatalogSnapshot()
+
+        if Task.isCancelled { return }
+
+        if catalogSnapshot.runtimeStatus == .unavailable {
+            ollamaActionState = .startingApp
+
+            let didStart = await ollamaModelCatalog.startOllamaApp()
+            if Task.isCancelled { return }
+
+            guard didStart else {
+                ollamaActionState = .failure(
+                    "Clicky couldn't launch Ollama automatically. Open Ollama for macOS once, then Clicky will connect."
+                )
+                ollamaRuntimeStatus = .unavailable
+                return
+            }
+
+            catalogSnapshot = await ollamaModelCatalog.fetchCatalogSnapshot()
+            if Task.isCancelled { return }
+        }
+
+        applyCatalogSnapshot(catalogSnapshot)
+
+        guard shouldPrepareSelectedModel,
+              catalogSnapshot.runtimeStatus == .ready,
+              !selectedModel.isEmpty else {
+            if !ollamaActionState.isBusy {
+                ollamaActionState = .idle
+            }
+            return
+        }
+
+        if !forceModelReload, catalogSnapshot.loadedModelNames.contains(selectedModel) {
             ollamaActionState = .idle
             return
         }
-        guard !ollamaActionState.isBusy || force else { return }
 
         let modelName = selectedModel
-        ollamaControlTask?.cancel()
         ollamaActionState = .loadingModel(modelName)
 
-        ollamaControlTask = Task {
-            do {
-                try await ollamaModelCatalog.preloadModel(named: modelName)
-                guard !Task.isCancelled else { return }
+        do {
+            try await ollamaModelCatalog.preloadModel(named: modelName)
+            if Task.isCancelled { return }
 
-                await MainActor.run {
-                    self.loadedOllamaModelNames.insert(modelName)
-                    self.ollamaActionState = .idle
-                    self.refreshOllamaRuntime(shouldPrepareSelectedModel: false)
-                }
-            } catch is CancellationError {
-                // Ignore cancellation.
-            } catch {
-                await MainActor.run {
-                    self.ollamaActionState = .failure(
-                        "Clicky couldn't load \(modelName) into Ollama. Try refreshing the runtime and loading it again."
-                    )
-                }
+            let refreshedSnapshot = await ollamaModelCatalog.fetchCatalogSnapshot()
+            if Task.isCancelled { return }
+
+            applyCatalogSnapshot(refreshedSnapshot, preferredSelectedModelName: modelName)
+            loadedOllamaModelNames.insert(modelName)
+            ollamaActionState = .idle
+        } catch is CancellationError {
+            // Ignore cancellation when a newer startup or model-selection request supersedes this one.
+        } catch {
+            ollamaActionState = .failure(
+                "Clicky couldn't load \(modelName) into Ollama. Try refreshing the runtime and loading it again."
+            )
+        }
+    }
+
+    private func applyCatalogSnapshot(
+        _ catalogSnapshot: OllamaModelCatalogSnapshot,
+        preferredSelectedModelName: String? = nil
+    ) {
+        availableOllamaModels = catalogSnapshot.models
+        loadedOllamaModelNames = catalogSnapshot.loadedModelNames
+        ollamaRuntimeStatus = catalogSnapshot.runtimeStatus
+
+        let savedModelName = preferredSelectedModelName ?? selectedModel
+        if let resolvedSelectedModelName = OllamaModelCatalog.defaultModelName(
+            from: catalogSnapshot.models,
+            savedModelName: savedModelName
+        ) {
+            if selectedModel != resolvedSelectedModelName {
+                selectedModel = resolvedSelectedModelName
+                UserDefaults.standard.set(resolvedSelectedModelName, forKey: "selectedOllamaModel")
             }
+        } else if catalogSnapshot.runtimeStatus != .ready {
+            selectedModel = ""
+            UserDefaults.standard.removeObject(forKey: "selectedOllamaModel")
         }
     }
 
@@ -527,7 +599,9 @@ final class CompanionManager: ObservableObject {
 
             // After 1m 30s, fade the music out over 3s
             onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: 90.0, repeats: false) { [weak self] _ in
-                self?.fadeOutOnboardingMusic()
+                Task { @MainActor [weak self] in
+                    self?.fadeOutOnboardingMusic()
+                }
             }
         } catch {
             print("⚠️ Clicky: Failed to play onboarding music: \(error)")
@@ -544,14 +618,29 @@ final class CompanionManager: ObservableObject {
         var stepsRemaining = fadeSteps
 
         onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { [weak self] timer in
-            stepsRemaining -= 1
-            player.volume -= volumeDecrement
-
-            if stepsRemaining <= 0 {
+            guard self != nil else {
                 timer.invalidate()
-                player.stop()
-                self?.onboardingMusicPlayer = nil
-                self?.onboardingMusicFadeTimer = nil
+                return
+            }
+
+            let willFinishOnThisTick = stepsRemaining <= 1
+            if willFinishOnThisTick {
+                timer.invalidate()
+            }
+
+            Task { @MainActor [weak self] in
+                guard let self, let player = self.onboardingMusicPlayer else {
+                    return
+                }
+
+                stepsRemaining -= 1
+                player.volume -= volumeDecrement
+
+                if willFinishOnThisTick {
+                    player.stop()
+                    self.onboardingMusicPlayer = nil
+                    self.onboardingMusicFadeTimer = nil
+                }
             }
         }
     }
@@ -564,6 +653,8 @@ final class CompanionManager: ObservableObject {
 
     func stop() {
         globalPushToTalkShortcutMonitor.stop()
+        pendingKeyboardShortcutStartTask?.cancel()
+        pendingKeyboardShortcutStartTask = nil
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
@@ -590,13 +681,9 @@ final class CompanionManager: ObservableObject {
         let previouslyHadMicrophone = hasMicrophonePermission
         let previouslyHadAll = allPermissionsGranted
 
-        let currentlyHasAccessibilityTrust = WindowPositionManager.hasAccessibilityPermission()
-        let canInstallGlobalShortcutMonitor = globalPushToTalkShortcutMonitor.start()
-        hasAccessibilityPermission = currentlyHasAccessibilityTrust || canInstallGlobalShortcutMonitor
-
-        if !hasAccessibilityPermission {
-            globalPushToTalkShortcutMonitor.stop()
-        }
+        let hasTrustedAccessibilityPermission = WindowPositionManager.hasAccessibilityPermission()
+        let hasFunctionalAccessibilityPermission = globalPushToTalkShortcutMonitor.grantsAccessibilityForAppFlow
+        hasAccessibilityPermission = hasTrustedAccessibilityPermission || hasFunctionalAccessibilityPermission
 
         let screenRecordingPermissionStatus = WindowPositionManager.currentScreenRecordingPermissionStatus()
         hasScreenRecordingPermission = screenRecordingPermissionStatus.isGrantedForAppFlow
@@ -622,10 +709,10 @@ final class CompanionManager: ObservableObject {
         if !previouslyHadMicrophone && hasMicrophonePermission {
             ClickyAnalytics.trackPermissionGranted(permission: "microphone")
         }
-        // Screen content permission is persisted — once the user has approved the
-        // SCShareableContent picker, we don't need to re-check it.
-        if !hasScreenContentPermission {
-            hasScreenContentPermission = UserDefaults.standard.bool(forKey: "hasScreenContentPermission")
+        // Screen capture is a best-effort capability on top of screen recording.
+        // It should not block the app's ready state when the core permissions are granted.
+        if !hasScreenRecordingPermission {
+            hasScreenContentPermission = false
         }
 
         if !previouslyHadAll && allPermissionsGranted {
@@ -640,6 +727,8 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.hideOverlay()
             isOverlayVisible = false
         }
+
+        refreshSpeechRuntimeStatus()
     }
 
     /// Triggers the macOS screen content picker by performing a dummy
@@ -706,8 +795,13 @@ final class CompanionManager: ObservableObject {
         accessibilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshAllPermissions()
+                self?.refreshSpeechRuntimeStatus()
             }
         }
+    }
+
+    private func refreshSpeechRuntimeStatus() {
+        speechRuntimeStatus = localSpeechSynthesizer.runtimeStatus
     }
 
     private func installApplicationDidBecomeActiveObserver() {
@@ -718,7 +812,9 @@ final class CompanionManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.refreshAllPermissions()
+            Task { @MainActor [weak self] in
+                self?.refreshAllPermissions()
+            }
         }
     }
 
@@ -824,6 +920,7 @@ final class CompanionManager: ObservableObject {
             }
         case .released:
             ClickyAnalytics.trackPushToTalkReleased()
+            pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
         case .none:
@@ -908,10 +1005,18 @@ final class CompanionManager: ObservableObject {
                     loadedOllamaModelNames.insert(selectedModel)
                 }
 
-                let shouldUseScreenshots = selectedModelSupportsVision
-                let screenCaptures = shouldUseScreenshots
-                    ? try await screenshotCapture()
-                    : []
+                let shouldAttemptScreenshots = selectedModelSupportsVision
+                var screenCaptures: [CompanionScreenCapture] = []
+
+                if shouldAttemptScreenshots {
+                    do {
+                        screenCaptures = try await screenshotCapture()
+                        hasScreenContentPermission = true
+                    } catch {
+                        hasScreenContentPermission = false
+                        print("⚠️ Companion screenshot capture unavailable: \(error.localizedDescription)")
+                    }
+                }
 
                 guard !Task.isCancelled else { return }
 
@@ -919,6 +1024,7 @@ final class CompanionManager: ObservableObject {
                     let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
                 }
+                let shouldUseScreenshots = !screenCaptures.isEmpty
 
                 let historyForAPI = conversationHistory.map { entry in
                     (userPrompt: entry.userTranscript, assistantResponse: entry.assistantResponse)
@@ -1144,7 +1250,9 @@ final class CompanionManager: ObservableObject {
             queue: .main
         ) { [weak self] in
             ClickyAnalytics.trackOnboardingDemoTriggered()
-            self?.performOnboardingDemoInteraction()
+            Task { @MainActor [weak self] in
+                self?.performOnboardingDemoInteraction()
+            }
         }
 
         // Fade out and clean up when the video finishes
@@ -1153,16 +1261,16 @@ final class CompanionManager: ObservableObject {
             object: player.currentItem,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            ClickyAnalytics.trackOnboardingVideoCompleted()
-            self.onboardingVideoOpacity = 0.0
-            // Wait for the 2s fade-out animation to complete before tearing down
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                ClickyAnalytics.trackOnboardingVideoCompleted()
+                self.onboardingVideoOpacity = 0.0
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard !Task.isCancelled else { return }
                 self.tearDownOnboardingVideo()
-                // After the video disappears, stream in the prompt to try talking
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    self.startOnboardingPromptStream()
-                }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+                self.startOnboardingPromptStream()
             }
         }
     }
@@ -1182,7 +1290,7 @@ final class CompanionManager: ObservableObject {
     }
 
     private func startOnboardingPromptStream() {
-        let message = "press control + option and introduce yourself"
+        let message = "press left control and introduce yourself"
         onboardingPromptText = ""
         showOnboardingPrompt = true
         onboardingPromptOpacity = 0.0
@@ -1192,25 +1300,41 @@ final class CompanionManager: ObservableObject {
         }
 
         var currentIndex = 0
-        Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { timer in
-            guard currentIndex < message.count else {
+        Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] timer in
+            guard self != nil else {
                 timer.invalidate()
-                // Auto-dismiss after 10 seconds
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
-                    guard self.showOnboardingPrompt else { return }
-                    withAnimation(.easeOut(duration: 0.3)) {
-                        self.onboardingPromptOpacity = 0.0
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                return
+            }
+
+            let hasCharactersRemaining = currentIndex < message.count
+            if !hasCharactersRemaining {
+                timer.invalidate()
+            }
+
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
+
+                guard hasCharactersRemaining else {
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 10_000_000_000)
+                        guard let self, self.showOnboardingPrompt, !Task.isCancelled else { return }
+                        withAnimation(.easeOut(duration: 0.3)) {
+                            self.onboardingPromptOpacity = 0.0
+                        }
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        guard !Task.isCancelled else { return }
                         self.showOnboardingPrompt = false
                         self.onboardingPromptText = ""
                     }
+                    return
                 }
-                return
+
+                let index = message.index(message.startIndex, offsetBy: currentIndex)
+                self.onboardingPromptText.append(message[index])
+                currentIndex += 1
             }
-            let index = message.index(message.startIndex, offsetBy: currentIndex)
-            self.onboardingPromptText.append(message[index])
-            currentIndex += 1
         }
     }
 
