@@ -5,8 +5,9 @@
 
 import Foundation
 import Testing
-@testable import leanring_buddy
+@testable import Clicky
 
+@MainActor
 struct LocalFirstMigrationTests {
     private actor TranscriptionInvocationRecorder {
         private(set) var primaryInvocationURLs: [URL] = []

@@ -21,7 +21,7 @@ final class LocalSpeechSynthesizer: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     var isSpeaking: Bool {
-        hasPendingPlayback || speechSynthesizer.isSpeaking
+        hasPendingPlayback
     }
 
     func speakText(_ text: String) async {
@@ -43,7 +43,7 @@ final class LocalSpeechSynthesizer: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     func stopPlayback() {
-        let shouldStopPlayback = hasPendingPlayback || speechSynthesizer.isSpeaking
+        let shouldStopPlayback = hasPendingPlayback
         hasPendingPlayback = false
 
         if shouldStopPlayback {
@@ -51,15 +51,21 @@ final class LocalSpeechSynthesizer: NSObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        hasPendingPlayback = true
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            self?.hasPendingPlayback = true
+        }
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        hasPendingPlayback = false
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            self?.hasPendingPlayback = false
+        }
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        hasPendingPlayback = false
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            self?.hasPendingPlayback = false
+        }
     }
 }

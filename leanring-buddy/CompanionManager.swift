@@ -82,12 +82,13 @@ final class CompanionManager: ObservableObject {
     private var onboardingMusicPlayer: AVAudioPlayer?
     private var onboardingMusicFadeTimer: Timer?
 
-    let buddyDictationManager = BuddyDictationManager()
-    let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
-    let overlayWindowManager = OverlayWindowManager()
-    private let ollamaModelCatalog = OllamaModelCatalog()
-    private let ollamaChatClient = OllamaChatClient()
-    private let localSpeechSynthesizer = LocalSpeechSynthesizer()
+    let buddyDictationManager: BuddyDictationManager
+    let globalPushToTalkShortcutMonitor: GlobalPushToTalkShortcutMonitor
+    let overlayWindowManager: OverlayWindowManager
+    private let ollamaModelCatalog: any OllamaModelCataloging
+    private let ollamaChatClient: any OllamaChatStreaming
+    private let localSpeechSynthesizer: any LocalSpeechSynthesizing
+    private let screenshotCapture: @MainActor () async throws -> [CompanionScreenCapture]
 
     /// Conversation history so the local model remembers prior exchanges within a session.
     /// Each entry stores only visible user/assistant text, never reasoning.
@@ -124,7 +125,35 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var ollamaActionState: CompanionOllamaActionState = .idle
 
     /// The selected Ollama model used for local responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedOllamaModel") ?? "gemma4:e4b"
+    @Published var selectedModel: String
+
+    init(
+        buddyDictationManager: BuddyDictationManager? = nil,
+        globalPushToTalkShortcutMonitor: GlobalPushToTalkShortcutMonitor? = nil,
+        overlayWindowManager: OverlayWindowManager? = nil,
+        ollamaModelCatalog: (any OllamaModelCataloging)? = nil,
+        ollamaChatClient: (any OllamaChatStreaming)? = nil,
+        localSpeechSynthesizer: (any LocalSpeechSynthesizing)? = nil,
+        screenshotCapture: @escaping @MainActor () async throws -> [CompanionScreenCapture] = {
+            try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+        },
+        selectedModel: String = UserDefaults.standard.string(forKey: "selectedOllamaModel") ?? "gemma4:e4b",
+        availableOllamaModels: [OllamaModelDescriptor] = [],
+        loadedOllamaModelNames: Set<String> = [],
+        ollamaRuntimeStatus: OllamaRuntimeStatus = .checking
+    ) {
+        self.buddyDictationManager = buddyDictationManager ?? BuddyDictationManager()
+        self.globalPushToTalkShortcutMonitor = globalPushToTalkShortcutMonitor ?? GlobalPushToTalkShortcutMonitor()
+        self.overlayWindowManager = overlayWindowManager ?? OverlayWindowManager()
+        self.ollamaModelCatalog = ollamaModelCatalog ?? OllamaModelCatalog()
+        self.ollamaChatClient = ollamaChatClient ?? OllamaChatClient()
+        self.localSpeechSynthesizer = localSpeechSynthesizer ?? LocalSpeechSynthesizer()
+        self.screenshotCapture = screenshotCapture
+        self.selectedModel = selectedModel
+        self.availableOllamaModels = availableOllamaModels
+        self.loadedOllamaModelNames = loadedOllamaModelNames
+        self.ollamaRuntimeStatus = ollamaRuntimeStatus
+    }
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
@@ -844,9 +873,18 @@ final class CompanionManager: ObservableObject {
     /// stays in the spinner/processing state until speech has been queued.
     /// The model response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToModelWithOptionalScreenshots(transcript: String) {
+    func sendTranscriptToModelWithOptionalScreenshots(transcript: String) {
         currentResponseTask?.cancel()
+        currentResponseTask = nil
         localSpeechSynthesizer.stopPlayback()
+        clearDetectedElementLocation()
+
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTranscript.isEmpty else {
+            voiceState = .idle
+            scheduleTransientHideIfNeeded()
+            return
+        }
 
         currentResponseTask = Task {
             voiceState = .processing
@@ -869,7 +907,7 @@ final class CompanionManager: ObservableObject {
 
                 let shouldUseScreenshots = selectedModelSupportsVision
                 let screenCaptures = shouldUseScreenshots
-                    ? try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                    ? try await screenshotCapture()
                     : []
 
                 guard !Task.isCancelled else { return }
@@ -890,11 +928,11 @@ final class CompanionManager: ObservableObject {
                         ? Self.companionVoiceResponseSystemPrompt
                         : Self.companionVoiceResponseSystemPrompt + "\n\nNo screenshots are attached for this turn. Answer without screen references and end with [POINT:none].",
                     conversationHistory: historyForAPI,
-	                    userPrompt: transcript,
-	                    onTextChunk: { _ in
-	                        // The overlay stays in spinner mode until local speech has been queued.
-	                    }
-	                )
+                    userPrompt: trimmedTranscript,
+                    onTextChunk: { _ in
+                        // The overlay stays in spinner mode until local speech has been queued.
+                    }
+                )
 
                 guard !Task.isCancelled else { return }
 
@@ -944,7 +982,7 @@ final class CompanionManager: ObservableObject {
                 }
 
                 conversationHistory.append((
-                    userTranscript: transcript,
+                    userTranscript: trimmedTranscript,
                     assistantResponse: spokenText
                 ))
 

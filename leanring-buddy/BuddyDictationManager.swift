@@ -216,7 +216,6 @@ private struct BuddyDictationDraftCallbacks {
 
 @MainActor
 final class BuddyDictationManager: NSObject, ObservableObject {
-    private static let defaultFinalTranscriptFallbackDelaySeconds: TimeInterval = 2.4
     private static let recordedAudioPowerHistoryLength = 44
     private static let recordedAudioPowerHistoryBaselineLevel: CGFloat = 0.02
     private static let recordedAudioPowerHistorySampleIntervalSeconds: TimeInterval = 0.07
@@ -263,8 +262,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
-    private let audioEngine = AVAudioEngine()
+    private let microphoneCaptureSessionFactory: () -> any BuddyMicrophoneCaptureSession
+    private let customPermissionRequester: (@MainActor () async -> Bool)?
+    private let defaultFinalTranscriptFallbackDelaySeconds: TimeInterval
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
+    private var activeMicrophoneCaptureSession: (any BuddyMicrophoneCaptureSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
     private var draftTextBeforeCurrentDictation = ""
@@ -280,10 +282,21 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// rapid follow-up requests that arrive before macOS updates its cache.
     private var lastPermissionRequestCompletedAt: Date?
 
-    override init() {
-        let transcriptionProvider = BuddyTranscriptionProviderFactory.makeDefaultProvider()
-        self.transcriptionProvider = transcriptionProvider
-        self.transcriptionProviderDisplayName = transcriptionProvider.displayName
+    init(
+        transcriptionProvider: (any BuddyTranscriptionProvider)? = nil,
+        microphoneCaptureSessionFactory: (() -> any BuddyMicrophoneCaptureSession)? = nil,
+        permissionRequester: (@MainActor () async -> Bool)? = nil,
+        defaultFinalTranscriptFallbackDelaySeconds: TimeInterval = 2.4
+    ) {
+        let resolvedTranscriptionProvider = transcriptionProvider
+            ?? BuddyTranscriptionProviderFactory.makeDefaultProvider()
+        let resolvedMicrophoneCaptureSessionFactory = microphoneCaptureSessionFactory
+            ?? { AVAudioEngineMicrophoneCaptureSession() }
+        self.transcriptionProvider = resolvedTranscriptionProvider
+        self.transcriptionProviderDisplayName = resolvedTranscriptionProvider.displayName
+        self.microphoneCaptureSessionFactory = resolvedMicrophoneCaptureSessionFactory
+        self.customPermissionRequester = permissionRequester
+        self.defaultFinalTranscriptFallbackDelaySeconds = defaultFinalTranscriptFallbackDelaySeconds
         super.init()
     }
 
@@ -342,8 +355,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             draftCallbacks?.updateDraftText(currentDraftText)
         }
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        activeMicrophoneCaptureSession?.cancelCapture()
+        activeMicrophoneCaptureSession = nil
         activeTranscriptionSession?.cancel()
 
         resetSessionState()
@@ -366,7 +379,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             // the app forward, we can safely continue into the permission check.
         }
 
-        let hasPermissions = await requestMicrophoneAndSpeechPermissionsWithoutDuplicatePrompts()
+        let hasPermissions = await requestPushToTalkPermissions()
         isPreparingToRecord = false
 
         if hasPermissions {
@@ -404,7 +417,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         currentPermissionProblem = nil
         isPreparingToRecord = true
 
-        guard await requestMicrophoneAndSpeechPermissionsWithoutDuplicatePrompts() else {
+        guard await requestPushToTalkPermissions() else {
             print("🎙️ BuddyDictationManager: permissions missing or denied")
             isPreparingToRecord = false
             return
@@ -451,8 +464,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             try await startRecognitionSession()
             guard !Task.isCancelled else {
                 print("🎙️ BuddyDictationManager: start cancelled (shortcut released during session start)")
-                audioEngine.stop()
-                audioEngine.inputNode.removeTap(onBus: 0)
+                activeMicrophoneCaptureSession?.cancelCapture()
+                activeMicrophoneCaptureSession = nil
                 activeTranscriptionSession?.cancel()
                 resetSessionState()
                 return
@@ -462,6 +475,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             }
             isPreparingToRecord = false
             print("🎙️ BuddyDictationManager: recognition session started")
+        } catch is CancellationError {
+            isPreparingToRecord = false
+            print("🎙️ BuddyDictationManager: start cancelled before capture finished opening")
+            resetSessionState()
         } catch {
             isPreparingToRecord = false
             lastErrorMessage = userFacingErrorMessage(
@@ -489,10 +506,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         isFinalizingTranscript = true
 
         let finalTranscriptFallbackDelaySeconds = activeTranscriptionSession?.finalTranscriptFallbackDelaySeconds
-            ?? Self.defaultFinalTranscriptFallbackDelaySeconds
+            ?? defaultFinalTranscriptFallbackDelaySeconds
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        activeMicrophoneCaptureSession?.stopCapturingAudio()
+        activeMicrophoneCaptureSession = nil
         activeTranscriptionSession?.requestFinalTranscript()
 
         finalizeFallbackWorkItem?.cancel()
@@ -512,6 +529,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private func startRecognitionSession() async throws {
+        activeMicrophoneCaptureSession?.cancelCapture()
+        activeMicrophoneCaptureSession = nil
         activeTranscriptionSession?.cancel()
         activeTranscriptionSession = nil
 
@@ -544,19 +563,21 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         )
 
         self.activeTranscriptionSession = activeTranscriptionSession
-        print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
-        let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-
-        inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
-            self?.updateAudioPowerLevel(from: buffer)
+        guard !Task.isCancelled, !isFinalizingTranscript else {
+            activeTranscriptionSession.requestFinalTranscript()
+            throw CancellationError()
         }
 
-        audioEngine.prepare()
-        try audioEngine.start()
+        print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
+
+        do {
+            try startMicrophoneCaptureSessionWithRetry()
+        } catch {
+            activeTranscriptionSession.cancel()
+            self.activeTranscriptionSession = nil
+            throw error
+        }
     }
 
     private func handleRecognitionError(_ error: Error) {
@@ -593,8 +614,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             currentDraftCallbacks?.updateDraftText(finalDraftText)
         }
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        activeMicrophoneCaptureSession?.cancelCapture()
+        activeMicrophoneCaptureSession = nil
         activeTranscriptionSession?.cancel()
 
         resetSessionState()
@@ -628,6 +649,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     private func resetSessionState() {
         pendingStartRequestIdentifier = UUID()
+        activeMicrophoneCaptureSession?.cancelCapture()
+        activeMicrophoneCaptureSession = nil
         activeTranscriptionSession = nil
         draftCallbacks = nil
         activeStartSource = nil
@@ -731,6 +754,46 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
 
         recordedAudioPowerHistory = updatedRecordedAudioPowerHistory
+    }
+
+    private func startMicrophoneCaptureSessionWithRetry(maxAttempts: Int = 2) throws {
+        var lastError: Error?
+
+        for attemptIndex in 0..<maxAttempts {
+            let microphoneCaptureSession = microphoneCaptureSessionFactory()
+
+            do {
+                try microphoneCaptureSession.startCapturingAudio { [weak self] audioBuffer in
+                    self?.activeTranscriptionSession?.appendAudioBuffer(audioBuffer)
+                    self?.updateAudioPowerLevel(from: audioBuffer)
+                }
+                activeMicrophoneCaptureSession = microphoneCaptureSession
+                return
+            } catch {
+                microphoneCaptureSession.cancelCapture()
+                lastError = error
+
+                guard let microphoneCaptureError = error as? BuddyMicrophoneCaptureError,
+                      microphoneCaptureError.isRetryable,
+                      attemptIndex < maxAttempts - 1 else {
+                    throw error
+                }
+
+                print("⚠️ BuddyDictationManager: microphone capture start failed, retrying with a fresh audio engine")
+            }
+        }
+
+        if let lastError {
+            throw lastError
+        }
+    }
+
+    private func requestPushToTalkPermissions() async -> Bool {
+        if let customPermissionRequester {
+            return await customPermissionRequester()
+        }
+
+        return await requestMicrophoneAndSpeechPermissionsWithoutDuplicatePrompts()
     }
 
     private func requestMicrophoneAndSpeechPermissionsIfNeeded() async -> Bool {
@@ -848,6 +911,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private func userFacingErrorMessage(from error: Error, fallback: String) -> String {
+        if let microphoneCaptureError = error as? BuddyMicrophoneCaptureError,
+           let errorDescription = microphoneCaptureError.errorDescription {
+            return errorDescription
+        }
+
         if let localizedError = error as? LocalizedError,
            let errorDescription = localizedError.errorDescription?
             .trimmingCharacters(in: .whitespacesAndNewlines),

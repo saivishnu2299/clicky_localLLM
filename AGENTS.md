@@ -42,6 +42,7 @@ The app no longer depends on a Cloudflare Worker or external AI APIs for chat, s
 | `leanring-buddy/OllamaModelCatalog.swift` | ~200 | Local Ollama model discovery plus in-app Ollama start, install, preload, and running-model status. |
 | `leanring-buddy/OllamaChatClient.swift` | ~160 | Streaming Ollama chat client that only accumulates visible assistant output. |
 | `leanring-buddy/WhisperKitTranscriptionProvider.swift` | ~290 | Local STT provider using WhisperKit with Apple Speech file transcription fallback. |
+| `leanring-buddy/BuddyMicrophoneCaptureSession.swift` | ~90 | Per-turn microphone capture abstraction that creates a fresh `AVAudioEngine` session for each push-to-talk turn. |
 | `leanring-buddy/LocalSpeechSynthesizer.swift` | ~70 | Local `AVSpeechSynthesizer` wrapper with start/stop/speaking state for the response pipeline. |
 | `leanring-buddy/BuddyDictationManager.swift` | ~850 | Shared push-to-talk audio pipeline and transcription session coordination. |
 | `leanring-buddy/BuddyTranscriptionProvider.swift` | ~60 | Provider abstraction and local-only provider resolution. |

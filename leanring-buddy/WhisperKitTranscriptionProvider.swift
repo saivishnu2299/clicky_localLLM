@@ -181,7 +181,7 @@ private actor WhisperKitRuntime {
     }
 }
 
-private final class WhisperKitTranscriptionSession: BuddyStreamingTranscriptionSession {
+final class WhisperKitTranscriptionSession: BuddyStreamingTranscriptionSession {
     let finalTranscriptFallbackDelaySeconds: TimeInterval = 18
 
     private static let targetSampleRate = 16_000
@@ -190,6 +190,7 @@ private final class WhisperKitTranscriptionSession: BuddyStreamingTranscriptionS
     private let onTranscriptUpdate: (String) -> Void
     private let onFinalTranscriptReady: (String) -> Void
     private let onError: (Error) -> Void
+    private let transcriptionPipeline: @Sendable (URL, [String]) async throws -> String
 
     private let stateQueue = DispatchQueue(label: "com.clicky.whisperkit.transcription")
     private let audioPCM16Converter = BuddyPCM16AudioConverter(
@@ -206,12 +207,19 @@ private final class WhisperKitTranscriptionSession: BuddyStreamingTranscriptionS
         keyterms: [String],
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
-        onError: @escaping (Error) -> Void
+        onError: @escaping (Error) -> Void,
+        transcriptionPipeline: @escaping @Sendable (URL, [String]) async throws -> String = { audioFileURL, keyterms in
+            try await WhisperKitFileTranscriptionPipeline.transcribeAudioFile(
+                at: audioFileURL,
+                contextualKeyterms: keyterms
+            )
+        }
     ) {
         self.keyterms = keyterms
         self.onTranscriptUpdate = onTranscriptUpdate
         self.onFinalTranscriptReady = onFinalTranscriptReady
         self.onError = onError
+        self.transcriptionPipeline = transcriptionPipeline
     }
 
     func appendAudioBuffer(_ audioBuffer: AVAudioPCMBuffer) {
@@ -271,10 +279,7 @@ private final class WhisperKitTranscriptionSession: BuddyStreamingTranscriptionS
         do {
             try wavAudioData.write(to: temporaryAudioFileURL, options: .atomic)
 
-            let transcriptText = try await WhisperKitFileTranscriptionPipeline.transcribeAudioFile(
-                at: temporaryAudioFileURL,
-                contextualKeyterms: keyterms
-            )
+            let transcriptText = try await transcriptionPipeline(temporaryAudioFileURL, keyterms)
 
             guard !stateQueue.sync(execute: { isCancelled }) else { return }
 
