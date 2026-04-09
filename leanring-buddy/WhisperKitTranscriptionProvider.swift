@@ -20,8 +20,8 @@ struct WhisperKitTranscriptionProviderError: LocalizedError {
 
 enum LocalFileTranscriptionFallback {
     static func transcribe(
-        primaryTranscription: @Sendable () async throws -> String,
-        fallbackTranscription: @Sendable () async throws -> String,
+        primaryTranscription: @escaping @Sendable () async throws -> String,
+        fallbackTranscription: @escaping @Sendable () async throws -> String,
         primaryTimeoutSeconds: TimeInterval = 12
     ) async throws -> String {
         do {

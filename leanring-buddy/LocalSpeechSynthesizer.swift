@@ -11,7 +11,9 @@ import Foundation
 @MainActor
 final class LocalSpeechSynthesizer: NSObject, AVSpeechSynthesizerDelegate {
     private let speechSynthesizer = AVSpeechSynthesizer()
-    private var speechStartContinuation: CheckedContinuation<Void, Never>?
+    // Tracks speech that has been queued but may not have reached AVFoundation's
+    // speaking state yet, so overlay teardown waits for the full playback lifecycle.
+    private var hasPendingPlayback = false
 
     override init() {
         super.init()
@@ -19,7 +21,7 @@ final class LocalSpeechSynthesizer: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     var isSpeaking: Bool {
-        speechSynthesizer.isSpeaking
+        hasPendingPlayback || speechSynthesizer.isSpeaking
     }
 
     func speakText(_ text: String) async {
@@ -36,41 +38,28 @@ final class LocalSpeechSynthesizer: NSObject, AVSpeechSynthesizerDelegate {
         utterance.volume = 1.0
         utterance.prefersAssistiveTechnologySettings = true
 
-        await withCheckedContinuation { continuation in
-            speechStartContinuation = continuation
-            speechSynthesizer.speak(utterance)
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                if let speechStartContinuation = self.speechStartContinuation {
-                    self.speechStartContinuation = nil
-                    speechStartContinuation.resume()
-                }
-            }
-        }
+        hasPendingPlayback = true
+        speechSynthesizer.speak(utterance)
     }
 
     func stopPlayback() {
-        if speechSynthesizer.isSpeaking {
-            speechSynthesizer.stopSpeaking(at: .immediate)
-        }
+        let shouldStopPlayback = hasPendingPlayback || speechSynthesizer.isSpeaking
+        hasPendingPlayback = false
 
-        if let speechStartContinuation {
-            self.speechStartContinuation = nil
-            speechStartContinuation.resume()
+        if shouldStopPlayback {
+            speechSynthesizer.stopSpeaking(at: .immediate)
         }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        if let speechStartContinuation {
-            self.speechStartContinuation = nil
-            speechStartContinuation.resume()
-        }
+        hasPendingPlayback = true
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        hasPendingPlayback = false
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        if let speechStartContinuation {
-            self.speechStartContinuation = nil
-            speechStartContinuation.resume()
-        }
+        hasPendingPlayback = false
     }
 }

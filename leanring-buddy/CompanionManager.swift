@@ -841,7 +841,7 @@ final class CompanionManager: ObservableObject {
 
     /// Captures screenshots when the selected model supports vision, sends the
     /// request to Ollama, and plays the response aloud locally. The cursor
-    /// stays in the spinner/processing state until speech playback begins.
+    /// stays in the spinner/processing state until speech has been queued.
     /// The model response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToModelWithOptionalScreenshots(transcript: String) {
@@ -890,11 +890,11 @@ final class CompanionManager: ObservableObject {
                         ? Self.companionVoiceResponseSystemPrompt
                         : Self.companionVoiceResponseSystemPrompt + "\n\nNo screenshots are attached for this turn. Answer without screen references and end with [POINT:none].",
                     conversationHistory: historyForAPI,
-                    userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // The overlay stays in spinner mode until local speech begins.
-                    }
-                )
+	                    userPrompt: transcript,
+	                    onTextChunk: { _ in
+	                        // The overlay stays in spinner mode until local speech has been queued.
+	                    }
+	                )
 
                 guard !Task.isCancelled else { return }
 
@@ -957,8 +957,8 @@ final class CompanionManager: ObservableObject {
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    await localSpeechSynthesizer.speakText(spokenText)
                     voiceState = .responding
+                    await localSpeechSynthesizer.speakText(spokenText)
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted.
@@ -1008,9 +1008,8 @@ final class CompanionManager: ObservableObject {
     }
 
     private func speakLocalFallbackMessage(_ message: String) async {
-        localSpeechSynthesizer.stopPlayback()
-        await localSpeechSynthesizer.speakText(message)
         voiceState = .responding
+        await localSpeechSynthesizer.speakText(message)
     }
 
     // MARK: - Point Tag Parsing
