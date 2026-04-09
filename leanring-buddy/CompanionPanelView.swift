@@ -12,7 +12,6 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
-    @State private var emailInput: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -25,12 +24,15 @@ struct CompanionPanelView: View {
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
 
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            if companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 12)
 
-                modelPickerRow
-                    .padding(.horizontal, 16)
+                if companionManager.ollamaRuntimeStatus == .ready {
+                    modelPickerRow
+                } else {
+                    localRuntimeSetupRow
+                }
             }
 
             if !companionManager.allPermissionsGranted {
@@ -41,24 +43,15 @@ struct CompanionPanelView: View {
                     .padding(.horizontal, 16)
             }
 
-            if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            if companionManager.allPermissionsGranted && companionManager.ollamaRuntimeStatus == .ready {
                 Spacer()
-                    .frame(height: 16)
+                    .frame(height: 12)
 
-                startButton
+                showClickyCursorToggleRow
                     .padding(.horizontal, 16)
             }
 
-            // Show Clicky toggle — hidden for now
-            // if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            //     Spacer()
-            //         .frame(height: 16)
-            //
-            //     showClickyCursorToggleRow
-            //         .padding(.horizontal, 16)
-            // }
-
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            if companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 16)
 
@@ -79,6 +72,9 @@ struct CompanionPanelView: View {
         }
         .frame(width: 320)
         .background(panelBackground)
+        .onAppear {
+            companionManager.refreshOllamaRuntime()
+        }
     }
 
     // MARK: - Header
@@ -126,117 +122,40 @@ struct CompanionPanelView: View {
 
     @ViewBuilder
     private var permissionsCopySection: some View {
-        if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            Text("Hold Control+Option to talk.")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(DS.Colors.textSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else if companionManager.allPermissionsGranted && !companionManager.hasSubmittedEmail {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Drop your email to get started.")
-                    .font(.system(size: 12, weight: .medium))
+        if companionManager.allPermissionsGranted && companionManager.ollamaRuntimeStatus != .ready {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(companionManager.ollamaStatusTitle)
+                    .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
-                Text("If I keep building this, I'll keep you in the loop.")
+
+                Text(companionManager.ollamaStatusMessage)
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.allPermissionsGranted {
-            Text("You're all set. Hit Start to meet Clicky.")
+            Text("Hold Control + Option to talk. Release to send.")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        } else if companionManager.hasCompletedOnboarding {
-            // Permissions were revoked after onboarding — tell user to re-grant
+        } else {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Permissions needed")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
-                Text("Some permissions were revoked. Grant all four below to keep using Clicky.")
+                Text("Grant microphone, accessibility, screen recording, and screen content access to use push-to-talk with screenshots.")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Clicky only captures the screen while you are actively holding the hotkey.")
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Hi, I'm Farza. This is Clicky.")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(DS.Colors.textSecondary)
-
-                Text("A side project I made for fun to help me learn stuff as I use my computer.")
-                    .font(.system(size: 11))
-                    .foregroundColor(DS.Colors.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Text("Nothing runs in the background. Clicky will only take a screenshot when you press the hot key. So, you can give that permission in peace. If you are still sus, eh, I can't do much there champ.")
-                    .font(.system(size: 11))
-                    .foregroundColor(Color(red: 0.9, green: 0.4, blue: 0.4))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    // MARK: - Email + Start Button
-
-    @ViewBuilder
-    private var startButton: some View {
-        if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            if !companionManager.hasSubmittedEmail {
-                VStack(spacing: 8) {
-                    TextField("Enter your email", text: $emailInput)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(DS.Colors.textPrimary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                                .fill(Color.white.opacity(0.08))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                        )
-
-                    Button(action: {
-                        companionManager.submitEmail(emailInput)
-                    }) {
-                        Text("Submit")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(DS.Colors.textOnAccent)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(
-                                RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                                    .fill(emailInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                          ? DS.Colors.accent.opacity(0.4)
-                                          : DS.Colors.accent)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointerCursor()
-                    .disabled(emailInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            } else {
-                Button(action: {
-                    companionManager.triggerOnboarding()
-                }) {
-                    Text("Start")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(DS.Colors.textOnAccent)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                                .fill(DS.Colors.accent)
-                        )
-                }
-                .buttonStyle(.plain)
-                .pointerCursor()
-            }
         }
     }
 
@@ -294,6 +213,9 @@ struct CompanionPanelView: View {
                         // Triggers the system accessibility prompt (AXIsProcessTrustedWithOptions)
                         // on first attempt, then opens System Settings on subsequent attempts.
                         WindowPositionManager.requestAccessibilityPermission()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                            companionManager.refreshAllPermissions()
+                        }
                     }) {
                         Text("Grant")
                             .font(.system(size: 11, weight: .semibold))
@@ -347,9 +269,7 @@ struct CompanionPanelView: View {
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(DS.Colors.textSecondary)
 
-                    Text(isGranted
-                         ? "Only takes a screenshot when you use the hotkey"
-                         : "Quit and reopen after granting")
+                    Text(screenRecordingStatusText(isGranted: isGranted))
                         .font(.system(size: 10))
                         .foregroundColor(DS.Colors.textTertiary)
                 }
@@ -388,6 +308,18 @@ struct CompanionPanelView: View {
             }
         }
         .padding(.vertical, 6)
+    }
+
+    private func screenRecordingStatusText(isGranted: Bool) -> String {
+        if !isGranted {
+            return "Quit and reopen after granting"
+        }
+
+        if companionManager.isScreenRecordingPermissionPendingRelaunch {
+            return "Granted. If capture still fails, quit and reopen Clicky once."
+        }
+
+        return "Only takes a screenshot when you use the hotkey"
     }
 
     private var screenContentPermissionRow: some View {
@@ -577,7 +509,7 @@ struct CompanionPanelView: View {
     private var speechToTextProviderRow: some View {
         HStack {
             HStack(spacing: 8) {
-                Image(systemName: "mic.badge.waveform")
+                Image(systemName: "waveform")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(DS.Colors.textTertiary)
                     .frame(width: 16)
@@ -596,49 +528,208 @@ struct CompanionPanelView: View {
         .padding(.vertical, 4)
     }
 
+    private var localRuntimeSetupRow: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(localRuntimeActionCopy)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 8) {
+                if companionManager.canStartOllamaFromUI {
+                    runtimeActionButton(label: "Start Ollama") {
+                        companionManager.startOllamaFromPanel()
+                    }
+                }
+
+                if companionManager.canInstallRecommendedModelFromUI {
+                    runtimeActionButton(label: "Install \(companionManager.recommendedModelName)") {
+                        companionManager.installRecommendedModelFromPanel()
+                    }
+                }
+
+                runtimeSecondaryButton(label: "Refresh") {
+                    companionManager.refreshOllamaRuntime()
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+
+    private var localRuntimeActionCopy: String {
+        companionManager.ollamaStatusMessage
+    }
+
     // MARK: - Model Picker
 
     private var modelPickerRow: some View {
-        HStack {
-            Text("Model")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(DS.Colors.textSecondary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Model")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
 
-            Spacer()
+                Spacer()
 
-            HStack(spacing: 0) {
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                if companionManager.selectedModelSupportsVision {
+                    Text("Vision")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(DS.Colors.success)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule()
+                                .fill(DS.Colors.success.opacity(0.12))
+                        )
+                } else {
+                    Text("Text Only")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(DS.Colors.warning)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule()
+                                .fill(DS.Colors.warning.opacity(0.12))
+                        )
+                }
             }
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
+
+            Menu {
+                ForEach(companionManager.availableOllamaModels) { modelDescriptor in
+                    Button(action: {
+                        companionManager.setSelectedModel(modelDescriptor.name)
+                    }) {
+                        HStack {
+                            Text(modelDescriptor.name)
+                            Spacer()
+                            Text(modelDescriptor.supportsVision ? "Vision" : "Text")
+                        }
+                    }
+                }
+
+                Divider()
+
+                Button(action: {
+                    companionManager.refreshOllamaRuntime()
+                }) {
+                    Text("Refresh Models")
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(companionManager.selectedModel.isEmpty ? "Select local model" : companionManager.selectedModel)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+
+            if let selectedModelDescriptor = companionManager.selectedModelDescriptor {
+                Text(modelMetadataText(for: selectedModelDescriptor))
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .lineLimit(2)
+            }
+
+            selectedModelReadinessRow
+
+            if companionManager.ollamaRuntimeStatus == .ready {
+                speechToTextProviderRow
+            }
         }
         .padding(.vertical, 4)
     }
 
-    private func modelOptionButton(label: String, modelID: String) -> some View {
-        let isSelected = companionManager.selectedModel == modelID
-        return Button(action: {
-            companionManager.setSelectedModel(modelID)
-        }) {
-            Text(label)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
-                )
+    private var selectedModelReadinessRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(selectedModelStatusColor)
+                    .frame(width: 8, height: 8)
+                    .shadow(color: selectedModelStatusColor.opacity(0.5), radius: 4)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(companionManager.selectedModelStatusTitle)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+
+                    Text(companionManager.selectedModelStatusMessage)
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                if companionManager.canLoadSelectedModelFromUI {
+                    runtimeActionButton(label: "Load Model") {
+                        companionManager.loadSelectedModelFromPanel(force: true)
+                    }
+                }
+
+                runtimeSecondaryButton(label: "Refresh") {
+                    companionManager.refreshOllamaRuntime()
+                }
+            }
         }
-        .buttonStyle(.plain)
-        .pointerCursor()
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+
+    private func modelMetadataText(for modelDescriptor: OllamaModelDescriptor) -> String {
+        var detailParts: [String] = []
+
+        if let parameterSize = modelDescriptor.parameterSize {
+            detailParts.append(parameterSize)
+        }
+
+        if let quantizationLevel = modelDescriptor.quantizationLevel {
+            detailParts.append(quantizationLevel)
+        }
+
+        if detailParts.isEmpty {
+            return modelDescriptor.supportsVision ? "vision-capable local model" : "text-only local model"
+        }
+
+        return detailParts.joined(separator: " • ")
     }
 
     // MARK: - DM Farza Button
@@ -695,24 +786,6 @@ struct CompanionPanelView: View {
             }
             .buttonStyle(.plain)
             .pointerCursor()
-
-            if companionManager.hasCompletedOnboarding {
-                Spacer()
-
-                Button(action: {
-                    companionManager.replayOnboarding()
-                }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "play.circle")
-                            .font(.system(size: 11, weight: .medium))
-                        Text("Watch Onboarding Again")
-                            .font(.system(size: 12, weight: .medium))
-                    }
-                    .foregroundColor(DS.Colors.textTertiary)
-                }
-                .buttonStyle(.plain)
-                .pointerCursor()
-            }
         }
     }
 
@@ -726,8 +799,14 @@ struct CompanionPanelView: View {
     }
 
     private var statusDotColor: Color {
+        if !companionManager.allPermissionsGranted || companionManager.ollamaRuntimeStatus != .ready {
+            return DS.Colors.warning
+        }
+        if !companionManager.isSelectedModelLoaded {
+            return DS.Colors.blue400
+        }
         if !companionManager.isOverlayVisible {
-            return DS.Colors.textTertiary
+            return DS.Colors.success
         }
         switch companionManager.voiceState {
         case .idle:
@@ -740,8 +819,11 @@ struct CompanionPanelView: View {
     }
 
     private var statusText: String {
-        if !companionManager.hasCompletedOnboarding || !companionManager.allPermissionsGranted {
+        if !companionManager.allPermissionsGranted || !companionManager.isOllamaReady {
             return "Setup"
+        }
+        if !companionManager.isSelectedModelLoaded {
+            return "Loading"
         }
         if !companionManager.isOverlayVisible {
             return "Ready"
@@ -756,6 +838,50 @@ struct CompanionPanelView: View {
         case .responding:
             return "Responding"
         }
+    }
+
+    private var selectedModelStatusColor: Color {
+        if companionManager.isSelectedModelLoaded {
+            return DS.Colors.success
+        }
+
+        if case .loadingModel = companionManager.ollamaActionState {
+            return DS.Colors.blue400
+        }
+
+        return DS.Colors.warning
+    }
+
+    private func runtimeActionButton(label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Colors.textOnAccent)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    Capsule()
+                        .fill(DS.Colors.accent)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    private func runtimeSecondaryButton(label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    Capsule()
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.8)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
     }
 
 }

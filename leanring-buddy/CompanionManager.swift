@@ -21,18 +21,38 @@ enum CompanionVoiceState {
     case responding
 }
 
+enum CompanionOllamaActionState: Equatable {
+    case idle
+    case startingApp
+    case installingRecommendedModel(progress: String?)
+    case loadingModel(String)
+    case failure(String)
+
+    var isBusy: Bool {
+        switch self {
+        case .startingApp, .installingRecommendedModel, .loadingModel:
+            return true
+        case .idle, .failure:
+            return false
+        }
+    }
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
+    private static let recommendedOllamaModelName = "gemma4:e4b"
+
     @Published private(set) var voiceState: CompanionVoiceState = .idle
     @Published private(set) var lastTranscript: String?
     @Published private(set) var currentAudioPowerLevel: CGFloat = 0
     @Published private(set) var hasAccessibilityPermission = false
     @Published private(set) var hasScreenRecordingPermission = false
+    @Published private(set) var isScreenRecordingPermissionPendingRelaunch = false
     @Published private(set) var hasMicrophonePermission = false
     @Published private(set) var hasScreenContentPermission = false
 
     /// Screen location (global AppKit coords) of a detected UI element the
-    /// buddy should fly to and point at. Parsed from Claude's response;
+    /// buddy should fly to and point at. Parsed from the local model response;
     /// observed by BlueCursorView to trigger the flight animation.
     @Published var detectedElementScreenLocation: CGPoint?
     /// The display frame (global AppKit coords) of the screen the detected
@@ -65,23 +85,12 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-    // Response text is now displayed inline on the cursor overlay via
-    // streamingResponseText, so no separate response overlay manager is needed.
+    private let ollamaModelCatalog = OllamaModelCatalog()
+    private let ollamaChatClient = OllamaChatClient()
+    private let localSpeechSynthesizer = LocalSpeechSynthesizer()
 
-    /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
-
-    private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
-    }()
-
-    private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
-    }()
-
-    /// Conversation history so Claude remembers prior exchanges within a session.
-    /// Each entry is the user's transcript and Claude's response.
+    /// Conversation history so the local model remembers prior exchanges within a session.
+    /// Each entry stores only visible user/assistant text, never reasoning.
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
 
     /// The currently running AI response task, if any. Cancelled when the user
@@ -92,7 +101,9 @@ final class CompanionManager: ObservableObject {
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
+    private var applicationDidBecomeActiveObserver: NSObjectProtocol?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
+    private var ollamaControlTask: Task<Void, Never>?
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
@@ -107,13 +118,147 @@ final class CompanionManager: ObservableObject {
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
 
-    /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    @Published private(set) var availableOllamaModels: [OllamaModelDescriptor] = []
+    @Published private(set) var loadedOllamaModelNames: Set<String> = []
+    @Published private(set) var ollamaRuntimeStatus: OllamaRuntimeStatus = .checking
+    @Published private(set) var ollamaActionState: CompanionOllamaActionState = .idle
+
+    /// The selected Ollama model used for local responses. Persisted to UserDefaults.
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedOllamaModel") ?? "gemma4:e4b"
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
-        UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
-        claudeAPI.model = model
+        UserDefaults.standard.set(model, forKey: "selectedOllamaModel")
+        loadSelectedModelFromPanel(force: true)
+    }
+
+    var selectedModelDescriptor: OllamaModelDescriptor? {
+        availableOllamaModels.first(where: { $0.name == selectedModel })
+    }
+
+    var selectedModelSupportsVision: Bool {
+        selectedModelDescriptor?.supportsVision ?? false
+    }
+
+    var isOllamaReady: Bool {
+        ollamaRuntimeStatus == .ready && !selectedModel.isEmpty
+    }
+
+    var isSelectedModelLoaded: Bool {
+        !selectedModel.isEmpty && loadedOllamaModelNames.contains(selectedModel)
+    }
+
+    var canStartOllamaFromUI: Bool {
+        ollamaRuntimeStatus == .unavailable && !ollamaActionState.isBusy
+    }
+
+    var canInstallRecommendedModelFromUI: Bool {
+        !ollamaActionState.isBusy
+            && ollamaRuntimeStatus != .checking
+            && !availableOllamaModels.contains(where: { $0.name == Self.recommendedOllamaModelName })
+    }
+
+    var canLoadSelectedModelFromUI: Bool {
+        isOllamaReady && !selectedModel.isEmpty && !isSelectedModelLoaded && !ollamaActionState.isBusy
+    }
+
+    var recommendedModelName: String {
+        Self.recommendedOllamaModelName
+    }
+
+    var selectedModelStatusTitle: String {
+        if selectedModel.isEmpty {
+            return "No model selected"
+        }
+
+        if case .loadingModel(let modelName) = ollamaActionState, modelName == selectedModel {
+            return "\(selectedModel) is loading"
+        }
+
+        if isSelectedModelLoaded {
+            return "\(selectedModel) is ready"
+        }
+
+        return "\(selectedModel) is installed"
+    }
+
+    var selectedModelStatusMessage: String {
+        guard !selectedModel.isEmpty else {
+            return "Install or select a local model to enable voice responses."
+        }
+
+        if case .loadingModel(let modelName) = ollamaActionState, modelName == selectedModel {
+            return "Clicky is loading the selected model into Ollama now."
+        }
+
+        if isSelectedModelLoaded {
+            if selectedModelSupportsVision {
+                return "Loaded in memory. Screenshot understanding, pointing, and spoken replies are ready."
+            }
+
+            return "Loaded in memory. Spoken replies are ready. This model will answer without screenshots or pointing."
+        }
+
+        if selectedModelSupportsVision {
+            return "Installed locally. Load it once and Clicky will use screenshots, pointing, and spoken replies."
+        }
+
+        return "Installed locally. Load it once and Clicky will answer with spoken text-only help."
+    }
+
+    var ollamaStatusTitle: String {
+        switch ollamaActionState {
+        case .startingApp:
+            return "Starting Ollama"
+        case .installingRecommendedModel:
+            return "Installing \(Self.recommendedOllamaModelName)"
+        case .loadingModel(let modelName):
+            return "Loading \(modelName)"
+        case .failure:
+            return "Ollama Setup Needed"
+        case .idle:
+            break
+        }
+
+        switch ollamaRuntimeStatus {
+        case .checking:
+            return "Checking Ollama"
+        case .unavailable:
+            return "Ollama Not Running"
+        case .noLocalModels:
+            return "Install a Local Model"
+        case .ready:
+            return "Local Mode Ready"
+        }
+    }
+
+    var ollamaStatusMessage: String {
+        switch ollamaActionState {
+        case .startingApp:
+            return "Launching the Ollama app and waiting for the local API to come online."
+        case .installingRecommendedModel(let progress):
+            return progress ?? "Downloading the recommended local model now."
+        case .loadingModel(let modelName):
+            return "Loading \(modelName) into Ollama so Clicky can answer immediately."
+        case .failure(let message):
+            return message
+        case .idle:
+            break
+        }
+
+        switch ollamaRuntimeStatus {
+        case .checking:
+            return "Checking your local Ollama runtime."
+        case .unavailable:
+            return "Start Ollama from this panel. Clicky will connect as soon as the local runtime is up."
+        case .noLocalModels:
+            return "Install the recommended local model here and Clicky will select it automatically."
+        case .ready:
+            if selectedModel.isEmpty {
+                return "Choose a local model to start using Clicky."
+            }
+            return selectedModelStatusMessage
+        }
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -173,61 +318,162 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        installApplicationDidBecomeActiveObserver()
         refreshAllPermissions()
-        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
-        // Eagerly touch the Claude API so its TLS warmup handshake completes
-        // well before the onboarding demo fires at ~40s into the video.
-        _ = claudeAPI
+        refreshOllamaRuntime()
 
-        // If the user already completed onboarding AND all permissions are
-        // still granted, show the cursor overlay immediately. If permissions
-        // were revoked (e.g. signing change), don't show the cursor — the
-        // panel will show the permissions UI instead.
-        if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
+        if allPermissionsGranted && isClickyCursorEnabled {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
         }
     }
 
-    /// Called by BlueCursorView after the buddy finishes its pointing
-    /// animation and returns to cursor-following mode.
-    /// Triggers the onboarding sequence — dismisses the panel and restarts
-    /// the overlay so the welcome animation and intro video play.
-    func triggerOnboarding() {
-        // Post notification so the panel manager can dismiss the panel
-        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+    func refreshOllamaRuntime(shouldPrepareSelectedModel: Bool = true) {
+        if !ollamaActionState.isBusy {
+            ollamaActionState = .idle
+        }
+        ollamaRuntimeStatus = .checking
 
-        // Mark onboarding as completed so the Start button won't appear
-        // again on future launches — the cursor will auto-show instead
-        hasCompletedOnboarding = true
+        Task {
+            let catalogSnapshot = await ollamaModelCatalog.fetchCatalogSnapshot()
 
-        ClickyAnalytics.trackOnboardingStarted()
+            availableOllamaModels = catalogSnapshot.models
+            loadedOllamaModelNames = catalogSnapshot.loadedModelNames
+            ollamaRuntimeStatus = catalogSnapshot.runtimeStatus
 
-        // Play Besaid theme at 60% volume, fade out after 1m 30s
-        startOnboardingMusic()
+            if let resolvedSelectedModelName = OllamaModelCatalog.defaultModelName(
+                from: catalogSnapshot.models,
+                savedModelName: selectedModel
+            ) {
+                if selectedModel != resolvedSelectedModelName {
+                    setSelectedModel(resolvedSelectedModelName)
+                }
+            } else if catalogSnapshot.runtimeStatus != .ready {
+                selectedModel = ""
+                UserDefaults.standard.removeObject(forKey: "selectedOllamaModel")
+            }
 
-        // Show the overlay for the first time — isFirstAppearance triggers
-        // the welcome animation and onboarding video
-        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-        isOverlayVisible = true
+            if shouldPrepareSelectedModel,
+               catalogSnapshot.runtimeStatus == .ready,
+               !selectedModel.isEmpty,
+               !catalogSnapshot.loadedModelNames.contains(selectedModel) {
+                loadSelectedModelFromPanel()
+            }
+        }
     }
 
-    /// Replays the onboarding experience from the "Watch Onboarding Again"
-    /// footer link. Same flow as triggerOnboarding but the cursor overlay
-    /// is already visible so we just restart the welcome animation and video.
-    func replayOnboarding() {
-        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
-        ClickyAnalytics.trackOnboardingReplayed()
-        startOnboardingMusic()
-        // Tear down any existing overlays and recreate with isFirstAppearance = true
-        overlayWindowManager.hasShownOverlayBefore = false
-        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-        isOverlayVisible = true
+    func startOllamaFromPanel() {
+        guard !ollamaActionState.isBusy else { return }
+
+        ollamaControlTask?.cancel()
+        ollamaActionState = .startingApp
+
+        ollamaControlTask = Task {
+            let didStart = await ollamaModelCatalog.startOllamaApp()
+            guard !Task.isCancelled else { return }
+
+            if didStart {
+                await MainActor.run {
+                    self.ollamaActionState = .idle
+                    self.refreshOllamaRuntime()
+                }
+            } else {
+                await MainActor.run {
+                    self.ollamaActionState = .failure(
+                        "Clicky couldn't launch the Ollama app. Install Ollama for macOS or open it once manually."
+                    )
+                }
+            }
+        }
+    }
+
+    func installRecommendedModelFromPanel() {
+        guard !ollamaActionState.isBusy else { return }
+
+        ollamaControlTask?.cancel()
+        ollamaActionState = .installingRecommendedModel(progress: "Preparing \(Self.recommendedOllamaModelName).")
+
+        ollamaControlTask = Task {
+            if ollamaRuntimeStatus == .unavailable {
+                let didStart = await ollamaModelCatalog.startOllamaApp()
+                guard !Task.isCancelled else { return }
+
+                guard didStart else {
+                    await MainActor.run {
+                        self.ollamaActionState = .failure(
+                            "Clicky couldn't start Ollama, so it can't install the recommended model yet."
+                        )
+                    }
+                    return
+                }
+            }
+
+            do {
+                try await ollamaModelCatalog.pullModel(named: Self.recommendedOllamaModelName) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        self?.ollamaActionState = .installingRecommendedModel(progress: progress.userFacingDescription)
+                    }
+                }
+
+                guard !Task.isCancelled else { return }
+
+                await MainActor.run {
+                    self.ollamaActionState = .idle
+                    self.selectedModel = Self.recommendedOllamaModelName
+                    UserDefaults.standard.set(Self.recommendedOllamaModelName, forKey: "selectedOllamaModel")
+                    self.refreshOllamaRuntime()
+                }
+            } catch is CancellationError {
+                // Ignore cancellation.
+            } catch {
+                await MainActor.run {
+                    self.ollamaActionState = .failure(
+                        "The model download failed. Make sure Ollama is online and try again."
+                    )
+                }
+            }
+        }
+    }
+
+    func loadSelectedModelFromPanel(force: Bool = false) {
+        guard isOllamaReady else { return }
+        guard !selectedModel.isEmpty else { return }
+        guard force || !isSelectedModelLoaded else {
+            ollamaActionState = .idle
+            return
+        }
+        guard !ollamaActionState.isBusy || force else { return }
+
+        let modelName = selectedModel
+        ollamaControlTask?.cancel()
+        ollamaActionState = .loadingModel(modelName)
+
+        ollamaControlTask = Task {
+            do {
+                try await ollamaModelCatalog.preloadModel(named: modelName)
+                guard !Task.isCancelled else { return }
+
+                await MainActor.run {
+                    self.loadedOllamaModelNames.insert(modelName)
+                    self.ollamaActionState = .idle
+                    self.refreshOllamaRuntime(shouldPrepareSelectedModel: false)
+                }
+            } catch is CancellationError {
+                // Ignore cancellation.
+            } catch {
+                await MainActor.run {
+                    self.ollamaActionState = .failure(
+                        "Clicky couldn't load \(modelName) into Ollama. Try refreshing the runtime and loading it again."
+                    )
+                }
+            }
+        }
     }
 
     private func stopOnboardingMusic() {
@@ -293,13 +539,20 @@ final class CompanionManager: ObservableObject {
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
 
+        ollamaControlTask?.cancel()
+        ollamaControlTask = nil
         currentResponseTask?.cancel()
         currentResponseTask = nil
+        localSpeechSynthesizer.stopPlayback()
         shortcutTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
         accessibilityCheckTimer?.invalidate()
         accessibilityCheckTimer = nil
+        if let applicationDidBecomeActiveObserver {
+            NotificationCenter.default.removeObserver(applicationDidBecomeActiveObserver)
+            self.applicationDidBecomeActiveObserver = nil
+        }
     }
 
     func refreshAllPermissions() {
@@ -308,16 +561,17 @@ final class CompanionManager: ObservableObject {
         let previouslyHadMicrophone = hasMicrophonePermission
         let previouslyHadAll = allPermissionsGranted
 
-        let currentlyHasAccessibility = WindowPositionManager.hasAccessibilityPermission()
-        hasAccessibilityPermission = currentlyHasAccessibility
+        let currentlyHasAccessibilityTrust = WindowPositionManager.hasAccessibilityPermission()
+        let canInstallGlobalShortcutMonitor = globalPushToTalkShortcutMonitor.start()
+        hasAccessibilityPermission = currentlyHasAccessibilityTrust || canInstallGlobalShortcutMonitor
 
-        if currentlyHasAccessibility {
-            globalPushToTalkShortcutMonitor.start()
-        } else {
+        if !hasAccessibilityPermission {
             globalPushToTalkShortcutMonitor.stop()
         }
 
-        hasScreenRecordingPermission = WindowPositionManager.hasScreenRecordingPermission()
+        let screenRecordingPermissionStatus = WindowPositionManager.currentScreenRecordingPermissionStatus()
+        hasScreenRecordingPermission = screenRecordingPermissionStatus.isGrantedForAppFlow
+        isScreenRecordingPermissionPendingRelaunch = screenRecordingPermissionStatus.requiresRelaunch
 
         let micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         hasMicrophonePermission = micAuthStatus == .authorized
@@ -347,6 +601,15 @@ final class CompanionManager: ObservableObject {
 
         if !previouslyHadAll && allPermissionsGranted {
             ClickyAnalytics.trackAllPermissionsGranted()
+        }
+
+        if allPermissionsGranted && isClickyCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        } else if !allPermissionsGranted && isOverlayVisible {
+            overlayWindowManager.hideOverlay()
+            isOverlayVisible = false
         }
     }
 
@@ -381,8 +644,7 @@ final class CompanionManager: ObservableObject {
                     UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
                     ClickyAnalytics.trackPermissionGranted(permission: "screen_content")
 
-                    // If onboarding was already completed, show the cursor overlay now
-                    if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
+                    if allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
                         overlayWindowManager.hasShownOverlayBefore = true
                         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                         isOverlayVisible = true
@@ -416,6 +678,18 @@ final class CompanionManager: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.refreshAllPermissions()
             }
+        }
+    }
+
+    private func installApplicationDidBecomeActiveObserver() {
+        guard applicationDidBecomeActiveObserver == nil else { return }
+
+        applicationDidBecomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshAllPermissions()
         }
     }
 
@@ -474,8 +748,6 @@ final class CompanionManager: ObservableObject {
         switch transition {
         case .pressed:
             guard !buddyDictationManager.isDictationInProgress else { return }
-            // Don't register push-to-talk while the onboarding video is playing
-            guard !showOnboardingVideo else { return }
 
             // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
@@ -493,20 +765,8 @@ final class CompanionManager: ObservableObject {
 
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
-            elevenLabsTTSClient.stopPlayback()
+            localSpeechSynthesizer.stopPlayback()
             clearDetectedElementLocation()
-
-            // Dismiss the onboarding prompt if it's showing
-            if showOnboardingPrompt {
-                withAnimation(.easeOut(duration: 0.3)) {
-                    onboardingPromptOpacity = 0.0
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    self.showOnboardingPrompt = false
-                    self.onboardingPromptText = ""
-                }
-            }
-    
 
             ClickyAnalytics.trackPushToTalkStarted()
 
@@ -521,7 +781,7 @@ final class CompanionManager: ObservableObject {
                         self?.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        self?.sendTranscriptToModelWithOptionalScreenshots(transcript: finalTranscript)
                     }
                 )
             }
@@ -542,7 +802,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
-    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk. when screenshots are attached, you can use them for screen-aware help. your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
     rules:
     - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
@@ -556,18 +816,19 @@ final class CompanionManager: ObservableObject {
     - don't read out code verbatim. describe what the code does or what needs to change conversationally.
     - focus on giving a thorough, useful explanation. don't end with simple yes/no questions like "want me to explain more?" or "should i show you?" — those are dead ends that force the user to just say yes.
     - instead, when it fits naturally, end by planting a seed — mention something bigger or more ambitious they could try, a related concept that goes deeper, or a next-level technique that builds on what you just explained. make it something worth coming back for, not a question they'd just nod to. it's okay to not end with anything extra if the answer is complete on its own.
-    - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
+    - if screenshots are attached, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
+    - never reveal reasoning, thinking traces, or chain-of-thought. answer with final visible output only.
 
     element pointing:
-    you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
+    you have a small blue triangle cursor that can fly to and point at things on screen, but only when screenshots are attached for this turn. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
 
     don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
 
-    when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
+    when screenshots are attached and you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
 
     format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
 
-    if pointing wouldn't help, append [POINT:none].
+    if screenshots are not attached, or pointing wouldn't help, append [POINT:none].
 
     examples:
     - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
@@ -578,65 +839,73 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - AI Response Pipeline
 
-    /// Captures a screenshot, sends it along with the transcript to Claude,
-    /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
-    /// the spinner/processing state until TTS audio begins playing.
-    /// Claude's response may include a [POINT:x,y:label] tag which triggers
+    /// Captures screenshots when the selected model supports vision, sends the
+    /// request to Ollama, and plays the response aloud locally. The cursor
+    /// stays in the spinner/processing state until speech playback begins.
+    /// The model response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+    private func sendTranscriptToModelWithOptionalScreenshots(transcript: String) {
         currentResponseTask?.cancel()
-        elevenLabsTTSClient.stopPlayback()
+        localSpeechSynthesizer.stopPlayback()
 
         currentResponseTask = Task {
-            // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
+            guard isOllamaReady else {
+                await speakLocalFallbackMessage(
+                    "ollama is not ready yet. open the clicky panel, start ollama, and load a local model first."
+                )
+                voiceState = .idle
+                currentResponseTask = nil
+                scheduleTransientHideIfNeeded()
+                return
+            }
+
             do {
-                // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                if !isSelectedModelLoaded {
+                    try await ollamaModelCatalog.preloadModel(named: selectedModel)
+                    loadedOllamaModelNames.insert(selectedModel)
+                }
+
+                let shouldUseScreenshots = selectedModelSupportsVision
+                let screenCaptures = shouldUseScreenshots
+                    ? try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                    : []
 
                 guard !Task.isCancelled else { return }
 
-                // Build image labels with the actual screenshot pixel dimensions
-                // so Claude's coordinate space matches the image it sees. We
-                // scale from screenshot pixels to display points ourselves.
                 let labeledImages = screenCaptures.map { capture in
                     let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
                 }
 
-                // Pass conversation history so Claude remembers prior exchanges
                 let historyForAPI = conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
+                    (userPrompt: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                let fullResponseText = try await ollamaChatClient.streamChatResponse(
+                    modelName: selectedModel,
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: shouldUseScreenshots
+                        ? Self.companionVoiceResponseSystemPrompt
+                        : Self.companionVoiceResponseSystemPrompt + "\n\nNo screenshots are attached for this turn. Answer without screen references and end with [POINT:none].",
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
                     onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                        // The overlay stays in spinner mode until local speech begins.
                     }
                 )
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if Claude returned coordinates.
-                // Switch to idle BEFORE setting the location so the triangle
-                // becomes visible and can fly to the target. Without this, the
-                // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
+                let hasPointCoordinate = parseResult.coordinate != nil && shouldUseScreenshots
                 if hasPointCoordinate {
                     voiceState = .idle
                 }
 
-                // Pick the screen capture matching Claude's screen number,
-                // falling back to the cursor screen if not specified.
                 let targetScreenCapture: CompanionScreenCapture? = {
                     if let screenNumber = parseResult.screenNumber,
                        screenNumber >= 1 && screenNumber <= screenCaptures.count {
@@ -647,27 +916,20 @@ final class CompanionManager: ObservableObject {
 
                 if let pointCoordinate = parseResult.coordinate,
                    let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
                     let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
                     let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
                     let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
                     let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
                     let displayFrame = targetScreenCapture.displayFrame
 
-                    // Clamp to screenshot coordinate space
                     let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
                     let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
 
-                    // Scale from screenshot pixels to display points
                     let displayLocalX = clampedX * (displayWidth / screenshotWidth)
                     let displayLocalY = clampedY * (displayHeight / screenshotHeight)
 
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
                     let appKitY = displayHeight - displayLocalY
 
-                    // Convert display-local coords to global screen coords
                     let globalLocation = CGPoint(
                         x: displayLocalX + displayFrame.origin.x,
                         y: appKitY + displayFrame.origin.y
@@ -681,14 +943,11 @@ final class CompanionManager: ObservableObject {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
                 }
 
-                // Save this exchange to conversation history (with the point tag
-                // stripped so it doesn't confuse future context)
                 conversationHistory.append((
                     userTranscript: transcript,
                     assistantResponse: spokenText
                 ))
 
-                // Keep only the last 10 exchanges to avoid unbounded context growth
                 if conversationHistory.count > 10 {
                     conversationHistory.removeFirst(conversationHistory.count - 10)
                 }
@@ -697,29 +956,23 @@ final class CompanionManager: ObservableObject {
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
-                // Play the response via TTS. Keep the spinner (processing state)
-                // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
-                    } catch {
-                        ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
-                    }
+                    await localSpeechSynthesizer.speakText(spokenText)
+                    voiceState = .responding
                 }
             } catch is CancellationError {
-                // User spoke again — response was interrupted
+                // User spoke again — response was interrupted.
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                await speakLocalFallbackMessage(
+                    "something went wrong with the local response. check that ollama is running and that the selected model finished loading, then try again."
+                )
             }
 
             if !Task.isCancelled {
                 voiceState = .idle
+                currentResponseTask = nil
                 scheduleTransientHideIfNeeded()
             }
         }
@@ -734,8 +987,7 @@ final class CompanionManager: ObservableObject {
 
         transientHideTask?.cancel()
         transientHideTask = Task {
-            // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
+            while localSpeechSynthesizer.isSpeaking {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -755,23 +1007,19 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
-    private func speakCreditsErrorFallback() {
-        let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
-        let synthesizer = NSSpeechSynthesizer()
-        synthesizer.startSpeaking(utterance)
+    private func speakLocalFallbackMessage(_ message: String) async {
+        localSpeechSynthesizer.stopPlayback()
+        await localSpeechSynthesizer.speakText(message)
         voiceState = .responding
     }
 
     // MARK: - Point Tag Parsing
 
-    /// Result of parsing a [POINT:...] tag from Claude's response.
+    /// Result of parsing a [POINT:...] tag from the model response.
     struct PointingParseResult {
         /// The response text with the [POINT:...] tag removed — this is what gets spoken.
         let spokenText: String
-        /// The parsed pixel coordinate, or nil if Claude said "none" or no tag was found.
+        /// The parsed pixel coordinate, or nil if the model said "none" or no tag was found.
         let coordinate: CGPoint?
         /// Short label describing the element (e.g. "run button"), or "none".
         let elementLabel: String?
@@ -779,7 +1027,7 @@ final class CompanionManager: ObservableObject {
         let screenNumber: Int?
     }
 
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Claude's response.
+    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of the model response.
     /// Returns the spoken text (tag removed) and the optional coordinate + label + screen number.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
         // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
@@ -961,19 +1209,24 @@ final class CompanionManager: ObservableObject {
     the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. origin (0,0) is top-left. x increases rightward, y increases downward.
     """
 
-    /// Captures a screenshot and asks Claude to find something interesting to
+    /// Captures a screenshot and asks the selected local vision model to find something interesting to
     /// point at, then triggers the buddy's flight animation. Used during
     /// onboarding to demo the pointing feature while the intro video plays.
     func performOnboardingDemoInteraction() {
-        // Don't interrupt an active voice response
         guard voiceState == .idle || voiceState == .responding else { return }
+        guard selectedModelSupportsVision else {
+            print("🎯 Onboarding demo skipped: selected model does not support vision")
+            return
+        }
+        guard isOllamaReady else {
+            print("🎯 Onboarding demo skipped: Ollama is not ready")
+            return
+        }
 
         Task {
             do {
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
 
-                // Only send the cursor screen so Claude can't pick something
-                // on a different monitor that we can't point at.
                 guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else {
                     print("🎯 Onboarding demo: no cursor screen found")
                     return
@@ -982,9 +1235,11 @@ final class CompanionManager: ObservableObject {
                 let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
                 let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                let fullResponseText = try await ollamaChatClient.streamChatResponse(
+                    modelName: selectedModel,
                     images: labeledImages,
                     systemPrompt: Self.onboardingDemoSystemPrompt,
+                    conversationHistory: [],
                     userPrompt: "look around my screen and find something interesting to point at",
                     onTextChunk: { _ in }
                 )
@@ -1012,8 +1267,6 @@ final class CompanionManager: ObservableObject {
                     y: appKitY + displayFrame.origin.y
                 )
 
-                // Set custom bubble text so the pointing animation uses Claude's
-                // comment instead of a random phrase
                 detectedElementBubbleText = parseResult.spokenText
                 detectedElementScreenLocation = globalLocation
                 detectedElementDisplayFrame = displayFrame

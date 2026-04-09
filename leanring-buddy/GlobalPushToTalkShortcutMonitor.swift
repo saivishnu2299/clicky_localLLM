@@ -17,6 +17,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
+    @Published private(set) var hasActiveEventTap = false
     /// Mutated exclusively from the CGEvent tap callback, which runs on
     /// `CFRunLoopGetMain()` and therefore always executes on the main thread.
     /// Published so the overlay can hide immediately on key release without
@@ -27,12 +28,16 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         stop()
     }
 
-    func start() {
+    @discardableResult
+    func start() -> Bool {
         // If the event tap is already running, don't restart it.
         // Restarting resets isShortcutCurrentlyPressed, which would kill
         // the waveform overlay mid-press when the permission poller calls
         // refreshAllPermissions → start() every few seconds.
-        guard globalEventTap == nil else { return }
+        guard globalEventTap == nil else {
+            hasActiveEventTap = true
+            return true
+        }
 
         let monitoredEventTypes: [CGEventType] = [.flagsChanged, .keyDown, .keyUp]
         let eventMask = monitoredEventTypes.reduce(CGEventMask(0)) { currentMask, eventType in
@@ -62,8 +67,9 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
+            hasActiveEventTap = false
             print("⚠️ Global push-to-talk: couldn't create CGEvent tap")
-            return
+            return false
         }
 
         guard let globalEventTapRunLoopSource = CFMachPortCreateRunLoopSource(
@@ -72,8 +78,9 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             0
         ) else {
             CFMachPortInvalidate(globalEventTap)
+            hasActiveEventTap = false
             print("⚠️ Global push-to-talk: couldn't create event tap run loop source")
-            return
+            return false
         }
 
         self.globalEventTap = globalEventTap
@@ -81,10 +88,13 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
         CFRunLoopAddSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
         CGEvent.tapEnable(tap: globalEventTap, enable: true)
+        hasActiveEventTap = true
+        return true
     }
 
     func stop() {
         isShortcutCurrentlyPressed = false
+        hasActiveEventTap = false
 
         if let globalEventTapRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)

@@ -16,6 +16,12 @@ enum PermissionRequestPresentationDestination: Equatable {
     case systemSettings
 }
 
+struct ScreenRecordingPermissionStatus: Equatable {
+    let isGrantedNow: Bool
+    let isGrantedForAppFlow: Bool
+    let requiresRelaunch: Bool
+}
+
 @MainActor
 class WindowPositionManager {
     private static var hasAttemptedAccessibilitySystemPromptDuringCurrentLaunch = false
@@ -78,10 +84,31 @@ class WindowPositionManager {
     /// Returns true if Screen Recording permission is granted.
     static func hasScreenRecordingPermission() -> Bool {
         let hasScreenRecordingPermissionNow = CGPreflightScreenCaptureAccess()
-        if hasScreenRecordingPermissionNow {
-            UserDefaults.standard.set(true, forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
-        }
+        persistPreviouslyConfirmedScreenRecordingPermissionIfNeeded(hasScreenRecordingPermissionNow)
         return hasScreenRecordingPermissionNow
+    }
+
+    static func currentScreenRecordingPermissionStatus() -> ScreenRecordingPermissionStatus {
+        currentScreenRecordingPermissionStatus(
+            hasScreenRecordingPermissionNow: hasScreenRecordingPermission(),
+            hasPreviouslyConfirmedScreenRecordingPermission: UserDefaults.standard.bool(forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
+        )
+    }
+
+    static func currentScreenRecordingPermissionStatus(
+        hasScreenRecordingPermissionNow: Bool,
+        hasPreviouslyConfirmedScreenRecordingPermission: Bool
+    ) -> ScreenRecordingPermissionStatus {
+        let isGrantedForAppFlow = shouldTreatScreenRecordingPermissionAsGrantedForSessionLaunch(
+            hasScreenRecordingPermissionNow: hasScreenRecordingPermissionNow,
+            hasPreviouslyConfirmedScreenRecordingPermission: hasPreviouslyConfirmedScreenRecordingPermission
+        )
+
+        return ScreenRecordingPermissionStatus(
+            isGrantedNow: hasScreenRecordingPermissionNow,
+            isGrantedForAppFlow: isGrantedForAppFlow,
+            requiresRelaunch: !hasScreenRecordingPermissionNow && hasPreviouslyConfirmedScreenRecordingPermission
+        )
     }
 
     /// Returns true when the app should proceed with session launch without showing
@@ -106,6 +133,11 @@ class WindowPositionManager {
         UserDefaults.standard.removeObject(forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
     }
 
+    private static func persistPreviouslyConfirmedScreenRecordingPermissionIfNeeded(_ isGranted: Bool) {
+        guard isGranted else { return }
+        UserDefaults.standard.set(true, forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
+    }
+
     /// Prompts the system dialog for Screen Recording permission.
     /// Uses the system prompt once, then opens System Settings on later attempts so
     /// the user never gets the prompt and the Settings pane at the same time.
@@ -121,7 +153,8 @@ class WindowPositionManager {
             return .alreadyGranted
         case .systemPrompt:
             hasAttemptedScreenRecordingSystemPromptDuringCurrentLaunch = true
-            _ = CGRequestScreenCaptureAccess()
+            let didGrantScreenRecordingPermission = CGRequestScreenCaptureAccess()
+            persistPreviouslyConfirmedScreenRecordingPermissionIfNeeded(didGrantScreenRecordingPermission)
         case .systemSettings:
             openScreenRecordingSettings()
         }

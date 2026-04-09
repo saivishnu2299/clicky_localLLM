@@ -37,4 +37,25 @@ struct leanring_buddyTests {
         #expect(shouldTreatPermissionAsGranted)
     }
 
+    @Test func previouslyConfirmedScreenRecordingPermissionStaysGrantedForAppFlow() async throws {
+        let permissionStatus = WindowPositionManager.currentScreenRecordingPermissionStatus(
+            hasScreenRecordingPermissionNow: false,
+            hasPreviouslyConfirmedScreenRecordingPermission: true
+        )
+
+        #expect(permissionStatus.isGrantedForAppFlow)
+        #expect(permissionStatus.requiresRelaunch)
+    }
+
+    @Test func liveScreenRecordingPermissionDoesNotRequireRelaunch() async throws {
+        let permissionStatus = WindowPositionManager.currentScreenRecordingPermissionStatus(
+            hasScreenRecordingPermissionNow: true,
+            hasPreviouslyConfirmedScreenRecordingPermission: true
+        )
+
+        #expect(permissionStatus.isGrantedNow)
+        #expect(permissionStatus.isGrantedForAppFlow)
+        #expect(!permissionStatus.requiresRelaunch)
+    }
+
 }

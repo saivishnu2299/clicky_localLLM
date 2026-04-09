@@ -125,7 +125,7 @@ struct BlueCursorView: View {
     }
     @State private var timer: Timer?
     @State private var welcomeText: String = ""
-    @State private var showWelcome: Bool = true
+    @State private var showWelcome: Bool = false
     @State private var bubbleSize: CGSize = .zero
     @State private var bubbleOpacity: Double = 1.0
     @State private var cursorOpacity: Double = 0.0
@@ -329,7 +329,7 @@ struct BlueCursorView: View {
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
-            // Blue spinner — shown while the AI is processing (transcription + Claude + waiting for TTS)
+            // Blue spinner — shown while the local pipeline is processing (transcription + model + waiting for TTS)
             BlueCursorSpinnerView()
                 .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing ? cursorOpacity : 0)
                 .position(cursorPosition)
@@ -348,25 +348,11 @@ struct BlueCursorView: View {
             self.cursorPosition = CGPoint(x: swiftUIPosition.x + 35, y: swiftUIPosition.y + 25)
 
             startTrackingCursor()
-
-            // Only show welcome message on first appearance (app start)
-            // and only if the cursor starts on this screen
-            if isFirstAppearance && isCursorOnThisScreen {
-                withAnimation(.easeIn(duration: 2.0)) {
-                    self.cursorOpacity = 1.0
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    self.bubbleOpacity = 0.0
-                    startWelcomeAnimation()
-                }
-            } else {
-                self.cursorOpacity = 1.0
-            }
+            self.cursorOpacity = 1.0
         }
         .onDisappear {
             timer?.invalidate()
             navigationAnimationTimer?.invalidate()
-            companionManager.tearDownOnboardingVideo()
         }
         .onChange(of: companionManager.detectedElementScreenLocation) { newLocation in
             // When a UI element location is detected, navigate the buddy to
