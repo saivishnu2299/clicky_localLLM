@@ -6,6 +6,7 @@
 //
 
 import AVFoundation
+import CoreMedia
 import Foundation
 
 enum BuddyMicrophoneCaptureError: LocalizedError {
@@ -96,5 +97,229 @@ final class AVAudioEngineMicrophoneCaptureSession: BuddyMicrophoneCaptureSession
 
     deinit {
         cancelCapture()
+    }
+}
+
+final class ResilientMicrophoneCaptureSession: BuddyMicrophoneCaptureSession {
+    private let sessionFactories: [() -> any BuddyMicrophoneCaptureSession]
+    private var activeCaptureSession: (any BuddyMicrophoneCaptureSession)?
+
+    init(
+        sessionFactories: [() -> any BuddyMicrophoneCaptureSession] = [
+            { AVAudioEngineMicrophoneCaptureSession() },
+            { AVCaptureSessionMicrophoneCaptureSession() }
+        ]
+    ) {
+        self.sessionFactories = sessionFactories
+    }
+
+    func startCapturingAudio(
+        onAudioBuffer: @escaping (AVAudioPCMBuffer) -> Void
+    ) throws {
+        cancelCapture()
+
+        var lastError: Error?
+
+        for (sessionIndex, sessionFactory) in sessionFactories.enumerated() {
+            let captureSession = sessionFactory()
+
+            do {
+                try captureSession.startCapturingAudio(onAudioBuffer: onAudioBuffer)
+                activeCaptureSession = captureSession
+
+                if sessionIndex > 0 {
+                    print("🎙️ Buddy microphone capture: using AVCapture fallback after AVAudioEngine startup failed")
+                }
+
+                return
+            } catch {
+                captureSession.cancelCapture()
+                lastError = error
+
+                if sessionIndex < sessionFactories.count - 1 {
+                    print("⚠️ Buddy microphone capture: primary audio engine startup failed, falling back to AVCapture")
+                }
+            }
+        }
+
+        if let lastError {
+            throw lastError
+        }
+
+        throw BuddyMicrophoneCaptureError.failedToStart(underlyingDescription: nil)
+    }
+
+    func stopCapturingAudio() {
+        activeCaptureSession?.stopCapturingAudio()
+        activeCaptureSession = nil
+    }
+
+    func cancelCapture() {
+        activeCaptureSession?.cancelCapture()
+        activeCaptureSession = nil
+    }
+
+    deinit {
+        cancelCapture()
+    }
+}
+
+final class AVCaptureSessionMicrophoneCaptureSession: NSObject, BuddyMicrophoneCaptureSession {
+    private let configurationQueue = DispatchQueue(label: "com.clicky.microphone-capture.configuration")
+    private let sampleBufferQueue = DispatchQueue(label: "com.clicky.microphone-capture.output")
+
+    private var captureSession: AVCaptureSession?
+    private var audioDataOutput: AVCaptureAudioDataOutput?
+    private var sampleBufferDelegate: SampleBufferDelegate?
+
+    func startCapturingAudio(
+        onAudioBuffer: @escaping (AVAudioPCMBuffer) -> Void
+    ) throws {
+        cancelCapture()
+
+        guard let audioDevice = AVCaptureDevice.default(for: .audio) else {
+            throw BuddyMicrophoneCaptureError.noInputDevice
+        }
+
+        let captureSession = AVCaptureSession()
+        let audioDataOutput = AVCaptureAudioDataOutput()
+        let sampleBufferDelegate = SampleBufferDelegate { sampleBuffer in
+            guard let audioBuffer = Self.makeAudioPCMBuffer(from: sampleBuffer) else { return }
+            onAudioBuffer(audioBuffer)
+        }
+
+        do {
+            let deviceInput = try AVCaptureDeviceInput(device: audioDevice)
+
+            captureSession.beginConfiguration()
+
+            guard captureSession.canAddInput(deviceInput) else {
+                captureSession.commitConfiguration()
+                throw BuddyMicrophoneCaptureError.failedToStart(
+                    underlyingDescription: "Clicky couldn't attach the selected microphone input."
+                )
+            }
+            captureSession.addInput(deviceInput)
+
+            guard captureSession.canAddOutput(audioDataOutput) else {
+                captureSession.commitConfiguration()
+                throw BuddyMicrophoneCaptureError.failedToStart(
+                    underlyingDescription: "Clicky couldn't create the microphone output stream."
+                )
+            }
+            captureSession.addOutput(audioDataOutput)
+
+            audioDataOutput.audioSettings = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsNonInterleaved: true
+            ]
+            audioDataOutput.setSampleBufferDelegate(sampleBufferDelegate, queue: sampleBufferQueue)
+
+            captureSession.commitConfiguration()
+
+            self.captureSession = captureSession
+            self.audioDataOutput = audioDataOutput
+            self.sampleBufferDelegate = sampleBufferDelegate
+
+            configurationQueue.sync {
+                captureSession.startRunning()
+            }
+
+            guard captureSession.isRunning else {
+                cancelCapture()
+                throw BuddyMicrophoneCaptureError.failedToStart(
+                    underlyingDescription: "AVCaptureSession failed to start the microphone stream."
+                )
+            }
+        } catch let microphoneCaptureError as BuddyMicrophoneCaptureError {
+            cancelCapture()
+            throw microphoneCaptureError
+        } catch {
+            cancelCapture()
+
+            let underlyingDescription = error.localizedDescription
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw BuddyMicrophoneCaptureError.failedToStart(
+                underlyingDescription: underlyingDescription.isEmpty ? nil : underlyingDescription
+            )
+        }
+    }
+
+    func stopCapturingAudio() {
+        let activeCaptureSession = captureSession
+        let activeAudioDataOutput = audioDataOutput
+
+        captureSession = nil
+        audioDataOutput = nil
+        sampleBufferDelegate = nil
+
+        activeAudioDataOutput?.setSampleBufferDelegate(nil, queue: nil)
+
+        configurationQueue.sync {
+            guard let activeCaptureSession, activeCaptureSession.isRunning else { return }
+            activeCaptureSession.stopRunning()
+        }
+    }
+
+    func cancelCapture() {
+        stopCapturingAudio()
+    }
+
+    private static func makeAudioPCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let streamDescriptionPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+            return nil
+        }
+
+        var streamDescription = streamDescriptionPointer.pointee
+        guard let audioFormat = AVAudioFormat(streamDescription: &streamDescription) else {
+            return nil
+        }
+
+        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frameCount > 0,
+              let audioBuffer = AVAudioPCMBuffer(
+                  pcmFormat: audioFormat,
+                  frameCapacity: frameCount
+              ) else {
+            return nil
+        }
+
+        audioBuffer.frameLength = frameCount
+
+        let copyStatus = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer,
+            at: 0,
+            frameCount: Int32(frameCount),
+            into: audioBuffer.mutableAudioBufferList
+        )
+
+        guard copyStatus == noErr else {
+            return nil
+        }
+
+        return audioBuffer
+    }
+
+    deinit {
+        cancelCapture()
+    }
+}
+
+private final class SampleBufferDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let onSampleBuffer: (CMSampleBuffer) -> Void
+
+    init(onSampleBuffer: @escaping (CMSampleBuffer) -> Void) {
+        self.onSampleBuffer = onSampleBuffer
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        onSampleBuffer(sampleBuffer)
     }
 }

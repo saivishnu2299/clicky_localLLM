@@ -324,7 +324,6 @@ struct VoicePipelineTests {
         }
 
         await Task.yield()
-        startTask.cancel()
         manager.stopPushToTalkFromKeyboardShortcut()
         await startTask.value
 
@@ -334,6 +333,32 @@ struct VoicePipelineTests {
 
         #expect(captureFactory.createdSessions.isEmpty)
         #expect(manager.lastErrorMessage == nil)
+    }
+
+    @Test func resilientMicrophoneCaptureFallsBackToSecondaryBackend() throws {
+        let primarySession = TestMicrophoneCaptureSession(
+            startError: BuddyMicrophoneCaptureError.failedToStart(
+                underlyingDescription: "AVAudioEngine could not start"
+            )
+        )
+        let fallbackSession = TestMicrophoneCaptureSession()
+
+        let resilientSession = ResilientMicrophoneCaptureSession(
+            sessionFactories: [
+                { primarySession },
+                { fallbackSession }
+            ]
+        )
+
+        try resilientSession.startCapturingAudio { _ in }
+
+        #expect(primarySession.startCallCount == 1)
+        #expect(primarySession.cancelCallCount == 1)
+        #expect(fallbackSession.startCallCount == 1)
+
+        resilientSession.stopCapturingAudio()
+
+        #expect(fallbackSession.stopCallCount == 1)
     }
 
     @Test func repeatedShortcutPressIsIgnoredWhileFinalizing() async throws {

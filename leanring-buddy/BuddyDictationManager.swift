@@ -291,7 +291,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let resolvedTranscriptionProvider = transcriptionProvider
             ?? BuddyTranscriptionProviderFactory.makeDefaultProvider()
         let resolvedMicrophoneCaptureSessionFactory = microphoneCaptureSessionFactory
-            ?? { AVAudioEngineMicrophoneCaptureSession() }
+            ?? { ResilientMicrophoneCaptureSession() }
         self.transcriptionProvider = resolvedTranscriptionProvider
         self.transcriptionProviderDisplayName = resolvedTranscriptionProvider.displayName
         self.microphoneCaptureSessionFactory = resolvedMicrophoneCaptureSessionFactory
@@ -398,6 +398,9 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
         print("🎙️ BuddyDictationManager: start requested (\(startSource))")
 
+        let startRequestIdentifier = UUID()
+        pendingStartRequestIdentifier = startRequestIdentifier
+
         if needsInitialPermissionPrompt {
             print("🎙️ BuddyDictationManager: requesting initial permissions")
             NSApplication.shared.activate(ignoringOtherApps: true)
@@ -409,9 +412,6 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 // we can safely continue into the permission request.
             }
         }
-
-        let startRequestIdentifier = UUID()
-        pendingStartRequestIdentifier = startRequestIdentifier
 
         lastErrorMessage = nil
         currentPermissionProblem = nil
@@ -461,13 +461,21 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
 
         do {
-            try await startRecognitionSession()
+            try await startRecognitionSession(startRequestIdentifier: startRequestIdentifier)
             guard !Task.isCancelled else {
                 print("🎙️ BuddyDictationManager: start cancelled (shortcut released during session start)")
                 activeMicrophoneCaptureSession?.cancelCapture()
                 activeMicrophoneCaptureSession = nil
                 activeTranscriptionSession?.cancel()
                 resetSessionState()
+                return
+            }
+            if isFinalizingTranscript {
+                print("🎙️ BuddyDictationManager: session opened after release, stopping capture immediately")
+                isPreparingToRecord = false
+                activeMicrophoneCaptureSession?.stopCapturingAudio()
+                activeMicrophoneCaptureSession = nil
+                activeTranscriptionSession?.requestFinalTranscript()
                 return
             }
             if startSource == .microphoneButton {
@@ -528,7 +536,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         )
     }
 
-    private func startRecognitionSession() async throws {
+    private func startRecognitionSession(startRequestIdentifier: UUID) async throws {
         activeMicrophoneCaptureSession?.cancelCapture()
         activeMicrophoneCaptureSession = nil
         activeTranscriptionSession?.cancel()
@@ -562,9 +570,18 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             }
         )
 
+        guard pendingStartRequestIdentifier == startRequestIdentifier,
+              !hasFinishedCurrentDictationSession else {
+            activeTranscriptionSession.cancel()
+            throw CancellationError()
+        }
+
         self.activeTranscriptionSession = activeTranscriptionSession
 
-        guard !Task.isCancelled, !isFinalizingTranscript else {
+        guard !Task.isCancelled,
+              !isFinalizingTranscript,
+              pendingStartRequestIdentifier == startRequestIdentifier,
+              !hasFinishedCurrentDictationSession else {
             activeTranscriptionSession.requestFinalTranscript()
             throw CancellationError()
         }
@@ -708,19 +725,34 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private func updateAudioPowerLevel(from audioBuffer: AVAudioPCMBuffer) {
-        guard let channelData = audioBuffer.floatChannelData else { return }
-
-        let channelSamples = channelData[0]
         let frameCount = Int(audioBuffer.frameLength)
         guard frameCount > 0 else { return }
 
-        var summedSquares: Float = 0
-        for sampleIndex in 0..<frameCount {
-            let sample = channelSamples[sampleIndex]
-            summedSquares += sample * sample
+        let rootMeanSquare: Float
+
+        switch audioBuffer.format.commonFormat {
+        case .pcmFormatFloat32:
+            guard let channelData = audioBuffer.floatChannelData else { return }
+            rootMeanSquare = rootMeanSquareLevel(
+                from: UnsafeBufferPointer(start: channelData[0], count: frameCount),
+                normalizationScale: 1
+            )
+        case .pcmFormatInt16:
+            guard let channelData = audioBuffer.int16ChannelData else { return }
+            rootMeanSquare = rootMeanSquareLevel(
+                from: UnsafeBufferPointer(start: channelData[0], count: frameCount),
+                normalizationScale: Float(Int16.max)
+            )
+        case .pcmFormatInt32:
+            guard let channelData = audioBuffer.int32ChannelData else { return }
+            rootMeanSquare = rootMeanSquareLevel(
+                from: UnsafeBufferPointer(start: channelData[0], count: frameCount),
+                normalizationScale: Float(Int32.max)
+            )
+        default:
+            return
         }
 
-        let rootMeanSquare = sqrt(summedSquares / Float(frameCount))
         let boostedLevel = min(max(rootMeanSquare * 10.2, 0), 1)
 
         DispatchQueue.main.async { [weak self] in
@@ -754,6 +786,38 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
 
         recordedAudioPowerHistory = updatedRecordedAudioPowerHistory
+    }
+
+    private func rootMeanSquareLevel<Sample: BinaryInteger>(
+        from samples: UnsafeBufferPointer<Sample>,
+        normalizationScale: Float
+    ) -> Float {
+        guard normalizationScale > 0 else { return 0 }
+
+        var summedSquares: Float = 0
+
+        for sample in samples {
+            let normalizedSample = Float(sample) / normalizationScale
+            summedSquares += normalizedSample * normalizedSample
+        }
+
+        return sqrt(summedSquares / Float(samples.count))
+    }
+
+    private func rootMeanSquareLevel(
+        from samples: UnsafeBufferPointer<Float>,
+        normalizationScale: Float
+    ) -> Float {
+        guard normalizationScale > 0 else { return 0 }
+
+        var summedSquares: Float = 0
+
+        for sample in samples {
+            let normalizedSample = sample / normalizationScale
+            summedSquares += normalizedSample * normalizedSample
+        }
+
+        return sqrt(summedSquares / Float(samples.count))
     }
 
     private func startMicrophoneCaptureSessionWithRetry(maxAttempts: Int = 2) throws {
