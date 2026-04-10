@@ -1,4 +1,4 @@
-# Clicky
+# Clicky (IN PROGRESS)
 
 Clicky is a local-first macOS menu bar assistant that lives next to your cursor. It uses push-to-talk voice input, captures screenshots only when you ask it to, answers through a local Ollama model, speaks with the system voice, and can point at UI elements with `[POINT:x,y:label:screenN]` tags.
 
